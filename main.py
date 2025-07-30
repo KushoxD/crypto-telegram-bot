@@ -18,36 +18,43 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 async def get_trending_tokens():
-    """Get trending crypto tokens from CoinGecko"""
+    """Get trending crypto tokens from CoinGecko - POSITIVE RETURNS ONLY, NO SUPPLEMENTS"""
     try:
         async with aiohttp.ClientSession() as session:
             url = "https://api.coingecko.com/api/v3/search/trending"
             async with session.get(url) as response:
                 if response.status == 200:
                     data = await response.json()
-                    tokens = []
+                    positive_tokens = []
                     
-                    for item in data.get('coins', []):
+                    for index, item in enumerate(data.get('coins', []), 1):
                         coin = item.get('item', {})
                         price_data = coin.get('data', {})
                         price_change = price_data.get('price_change_percentage_24h', {}).get('usd', 0) if price_data else 0
                         
-                        tokens.append({
-                            'id': coin.get('id', ''),
-                            'name': coin.get('name', ''),
-                            'symbol': coin.get('symbol', '').upper(),
-                            'rank': coin.get('market_cap_rank', 0),
-                            'price_change': price_change,
-                            'price': price_data.get('price', 0) if price_data else 0
-                        })
+                        # Only include tokens with POSITIVE returns
+                        if price_change > 0:
+                            token_data = {
+                                'id': coin.get('id', ''),
+                                'name': coin.get('name', ''),
+                                'symbol': coin.get('symbol', '').upper(),
+                                'rank': coin.get('market_cap_rank', 0),
+                                'price_change': price_change,
+                                'price': price_data.get('price', 0) if price_data else 0,
+                                'trending_position': index  # Original position in trending list
+                            }
+                            positive_tokens.append(token_data)
                     
-                    logger.info(f"Found {len(tokens)} trending tokens")
-                    return tokens[:30]  # Top 30
+                    # Keep original trending order (by trending rank, not by gains)
+                    # Already in correct order from API response
+                    
+                    logger.info(f"Found {len(positive_tokens)} POSITIVE trending tokens (independent, no supplements)")
+                    return positive_tokens  # Return all positive trending tokens (may be less than 30)
                 else:
                     logger.error(f"Trending API error: {response.status}")
                     return []
     except Exception as e:
-        logger.error(f"Error getting trending tokens: {e}")
+        logger.error(f"Error getting positive trending tokens: {e}")
         return []
 
 async def get_top_gainers():
@@ -62,14 +69,15 @@ async def get_top_gainers():
                     data = await response.json()
                     gainers = []
                     
-                    for gainer in data.get('top_gainers', []):
+                    for index, gainer in enumerate(data.get('top_gainers', []), 1):
                         gainers.append({
                             'id': gainer.get('id', ''),
                             'name': gainer.get('name', ''),
                             'symbol': gainer.get('symbol', '').upper(),
                             'rank': gainer.get('market_cap_rank', 0),
                             'price_change': gainer.get('usd_24h_change', 0),
-                            'price': gainer.get('usd', 0)
+                            'price': gainer.get('usd', 0),
+                            'gainer_position': index  # Actual position in gainers list
                         })
                     
                     logger.info(f"Found {len(gainers)} top gainers")
@@ -88,12 +96,17 @@ def create_section_message(section_type, new_tokens, all_tokens):
     
     # Section header
     if section_type == "trending":
-        section_header = f"📈 **NEW TRENDING TOKENS**\n🔥 {len(new_tokens)} NEW token(s) entered Top 30 Trending!\n\n"
+        section_header = f"📈 **NEW POSITIVE TRENDING TOKENS**\n🔥 {len(new_tokens)} NEW positive token(s) entered Trending!\n\n"
     else:  # gainers
         section_header = f"🚀 **NEW TOP GAINERS**\n💰 {len(new_tokens)} NEW token(s) entered Top 30 Gainers!\n\n"
     
-    # Create position mapping
-    token_positions = {token['id']: idx + 1 for idx, token in enumerate(all_tokens)}
+    # Create position mapping based on section type
+    if section_type == "trending":
+        # For trending: use trending_position (their actual rank in trending list)
+        token_positions = {token['id']: token.get('trending_position', idx + 1) for idx, token in enumerate(all_tokens)}
+    else:
+        # For gainers: use gainer_position (their actual rank in gainers list)
+        token_positions = {token['id']: token.get('gainer_position', idx + 1) for idx, token in enumerate(all_tokens)}
     
     # Sort new tokens by their position
     new_tokens_with_position = []
@@ -105,7 +118,8 @@ def create_section_message(section_type, new_tokens, all_tokens):
     
     section_content = ""
     for position, token in new_tokens_with_position:
-        change_emoji = "🟢" if token.get('price_change', 0) > 0 else "🔴" if token.get('price_change', 0) < 0 else "⚪"
+        # All should be positive now
+        change_emoji = "🟢"  
         price = token.get('price', 0)
         
         section_content += f"**#{position} {token['name']}** ({token['symbol']})\n"
@@ -117,8 +131,8 @@ def create_section_message(section_type, new_tokens, all_tokens):
                 price_str = f"${price:.2f}"
             section_content += f"💰 Price: {price_str}\n"
         
-        if token.get('price_change', 0) != 0:
-            section_content += f"{change_emoji} 24h Change: {token.get('price_change', 0):.2f}%\n"
+        # Always show positive change
+        section_content += f"{change_emoji} 24h Change: +{token.get('price_change', 0):.2f}%\n"
         
         if token.get('rank', 0) > 0:
             section_content += f"🏆 Market Cap Rank: #{token.get('rank')}\n"
@@ -208,22 +222,20 @@ async def check_both_lists(bot):
                 
                 # Log details for debugging
                 if new_trending:
-                    trending_positions = {token['id']: idx + 1 for idx, token in enumerate(current_trending)}
                     for token in new_trending:
-                        position = trending_positions.get(token['id'], '?')
-                        logger.info(f"  NEW TRENDING #{position}: {token['name']} ({token['symbol']}) - {token.get('price_change', 0):.2f}%")
+                        position = token.get('trending_position', '?')
+                        logger.info(f"  NEW TRENDING #{position}: {token['name']} ({token['symbol']}) - +{token.get('price_change', 0):.2f}%")
                 
                 if new_gainers:
-                    gainer_positions = {token['id']: idx + 1 for idx, token in enumerate(current_gainers)}
                     for token in new_gainers:
-                        position = gainer_positions.get(token['id'], '?')
-                        logger.info(f"  NEW GAINER #{position}: {token['name']} ({token['symbol']}) - {token.get('price_change', 0):.2f}%")
+                        position = token.get('gainer_position', '?')
+                        logger.info(f"  NEW GAINER #{position}: {token['name']} ({token['symbol']}) - +{token.get('price_change', 0):.2f}%")
         else:
             gmt8_time = datetime.now(GMT8).strftime('%H:%M')
             if subscribers:
                 logger.info(f"✅ No changes at {gmt8_time} GMT+8. Both lists unchanged. ({len(subscribers)} subscribers)")
             else:
-                logger.info(f"ℹ️ No subscribers yet. Monitoring {len(current_trending_ids)} trending + {len(current_gainer_ids)} gainers.")
+                logger.info(f"ℹ️ No subscribers yet. Monitoring {len(current_trending_ids)} positive trending + {len(current_gainer_ids)} gainers.")
         
         # Update previous tokens
         previous_trending_tokens = current_trending_ids
@@ -232,7 +244,75 @@ async def check_both_lists(bot):
     except Exception as e:
         logger.error(f"Error in dual check: {e}")
 
-def get_seconds_until_next_hour():
+def create_startup_report(trending_tokens, gainer_tokens):
+    """Create startup report showing both lists"""
+    gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
+    
+    message = f"🚀 **BOT STARTUP REPORT** 🚀\n"
+    message += f"📅 {gmt8_time} GMT+8\n"
+    message += f"✅ Bot deployed and monitoring successfully!\n\n"
+    
+    # Trending section
+    if trending_tokens:
+        message += f"📈 **TOP 30 TRENDING TOKENS**\n"
+        message += f"🔥 Currently monitoring {len(trending_tokens)} trending tokens\n\n"
+        
+        # Show top 10 trending (positive only, in trending rank order)
+        for token in trending_tokens[:10]:
+            # All should be positive now
+            if token.get('price_change', 0) > 0:
+                position = token.get('trending_position', '?')
+                price = token.get('price', 0)
+                
+                message += f"**#{position} {token['name']}** ({token['symbol']})\n"
+                
+                if price > 0:
+                    if price < 0.01:
+                        price_str = f"${price:.6f}"
+                    else:
+                        price_str = f"${price:.2f}"
+                    message += f"💰 Price: {price_str}\n"
+                
+                message += f"🟢 24h: +{token.get('price_change', 0):.2f}%\n"
+                message += "\n"
+        
+        if len(trending_tokens) > 10:
+            message += f"... and {len(trending_tokens) - 10} more trending tokens\n\n"
+    
+    message += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Gainers section
+    if gainer_tokens:
+        message += f"🚀 **TOP 30 GAINERS**\n"
+        message += f"💰 Currently monitoring {len(gainer_tokens)} top gainers\n\n"
+        
+        # Show top 10 gainers (in gainer rank order)
+        for token in gainer_tokens[:10]:
+            position = token.get('gainer_position', '?')
+            change_emoji = "🟢" if token.get('price_change', 0) > 0 else "🔴" if token.get('price_change', 0) < 0 else "⚪"
+            price = token.get('price', 0)
+            
+            message += f"**#{position} {token['name']}** ({token['symbol']})\n"
+            
+            if price > 0:
+                if price < 0.01:
+                    price_str = f"${price:.6f}"
+                else:
+                    price_str = f"${price:.2f}"
+                message += f"💰 Price: {price_str}\n"
+            
+            message += f"{change_emoji} 24h: {token.get('price_change', 0):+.2f}%\n"
+            message += "\n"
+        
+        if len(gainer_tokens) > 10:
+            message += f"... and {len(gainer_tokens) - 10} more gainers\n\n"
+    
+    next_check_minutes = get_seconds_until_next_hour() / 60
+    message += f"⏰ Next check: {next_check_minutes:.0f} minutes\n"
+    message += f"🎯 Will alert on changes to either list!\n"
+    message += f"📊 Ready to serve {len(subscribers)} subscribers"
+    
+    return message
     """Calculate seconds until next GMT+8 hour (XX:00:00)"""
     now = datetime.now(GMT8)
     next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -260,8 +340,8 @@ async def handle_message(bot, update_data):
 ✅ **You're now subscribed to DUAL crypto alerts!**
 
 **What I monitor:**
-📈 Top 30 Trending tokens (most searched)
-🚀 Top 30 Gainers (biggest price increases)
+📈 Top Positive Trending tokens (NEW entries only!)
+🚀 Top 30 Gainers (NEW entries only!)
 ⚡ Send alerts ONLY when NEW tokens enter either list
 🎯 Two sections: Changes in BOTH lists!
 
@@ -309,8 +389,8 @@ async def handle_message(bot, update_data):
 **Next Check:** {next_check_minutes:.0f} minutes
 
 **What We're Watching:**
-🔍 Top 30 Trending (most searched)
-💰 Top 30 Gainers (biggest % increases)
+🔍 Positive Trending (NEW entries with actual trending rank)
+💰 Top 30 Gainers (NEW entries with actual gainer rank)
 ⚡ NEW entries in either list
 ⏰ Hourly checks at XX:00 GMT+8
 
@@ -352,12 +432,16 @@ async def main():
     # Log startup
     gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f"🎯 DUAL TRACKING Bot started at {gmt8_time} GMT+8")
-    logger.info(f"📈 Monitoring: Top 30 Trending + Top 30 Gainers")
-    logger.info(f"🎯 Focus: CHANGES in both lists (no spam!)")
+    logger.info(f"📈 Monitoring: Top 30 Positive Trending + Top 30 Gainers")
+    logger.info(f"🎯 Focus: CHANGES in both lists (positive trending only!)")
     
     # Initial fetch to establish baseline
     logger.info("🔍 Establishing baseline for both lists...")
     await check_both_lists(bot)
+    
+    # Send startup report to verify bot is working
+    logger.info("📊 Sending startup report...")
+    await send_startup_report_to_admin(bot)
     
     # Calculate when to do first hourly check
     seconds_to_next_hour = get_seconds_until_next_hour()
