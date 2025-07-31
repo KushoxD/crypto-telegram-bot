@@ -5,10 +5,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from telegram import Bot
 
-# Simple storage for both lists
+# Simple storage for ATH tokens
 subscribers = set()
-previous_trending_tokens = set()
-previous_gainer_tokens = set()
+previous_ath_tokens = set()
 
 # GMT+8 timezone
 GMT8 = timezone(timedelta(hours=8))
@@ -17,220 +16,264 @@ GMT8 = timezone(timedelta(hours=8))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def get_trending_tokens():
-    """Get trending crypto tokens from CoinGecko - POSITIVE RETURNS ONLY"""
+async def get_top_marketcap_coins():
+    """Get top 300 coins by market cap to check for ATH"""
     try:
         async with aiohttp.ClientSession() as session:
-            url = "https://api.coingecko.com/api/v3/search/trending"
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    positive_tokens = []
-                    
-                    for index, item in enumerate(data.get('coins', []), 1):
-                        coin = item.get('item', {})
-                        price_data = coin.get('data', {})
-                        price_change = price_data.get('price_change_percentage_24h', {}).get('usd', 0) if price_data else 0
-                        
-                        # Only include tokens with POSITIVE returns
-                        if price_change > 0:
-                            token_data = {
-                                'id': coin.get('id', ''),
-                                'name': coin.get('name', ''),
-                                'symbol': coin.get('symbol', '').upper(),
-                                'rank': coin.get('market_cap_rank', 0),
-                                'price_change': price_change,
-                                'price': price_data.get('price', 0) if price_data else 0,
-                                'trending_position': index
-                            }
-                            positive_tokens.append(token_data)
-                    
-                    logger.info(f"Found {len(positive_tokens)} POSITIVE trending tokens")
-                    return positive_tokens
-                else:
-                    logger.error(f"Trending API error: {response.status}")
-                    return []
-    except Exception as e:
-        logger.error(f"Error getting trending tokens: {e}")
-        return []
-
-async def get_top_gainers():
-    """Get top 30 gainers from CoinGecko"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://api.coingecko.com/api/v3/coins/top_gainers_losers"
-            params = {'vs_currency': 'usd', 'duration': '24h'}
+            all_coin_ids = []
             
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    gainers = []
-                    
-                    for index, gainer in enumerate(data.get('top_gainers', []), 1):
-                        gainers.append({
-                            'id': gainer.get('id', ''),
-                            'name': gainer.get('name', ''),
-                            'symbol': gainer.get('symbol', '').upper(),
-                            'rank': gainer.get('market_cap_rank', 0),
-                            'price_change': gainer.get('usd_24h_change', 0),
-                            'price': gainer.get('usd', 0),
-                            'gainer_position': index
-                        })
-                    
-                    logger.info(f"Found {len(gainers)} top gainers")
-                    return gainers[:30]
-                else:
-                    logger.error(f"Gainers API error: {response.status}")
-                    return []
+            # Get top 300 coins (3 pages of 100 each)
+            for page in range(1, 4):
+                url = "https://api.coingecko.com/api/v3/coins/markets"
+                params = {
+                    'vs_currency': 'usd',
+                    'order': 'market_cap_desc',
+                    'per_page': 100,
+                    'page': page,
+                    'sparkline': False,
+                    'locale': 'en'
+                }
+                
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        coin_ids = [coin['id'] for coin in data]
+                        all_coin_ids.extend(coin_ids)
+                        logger.info(f"Retrieved page {page}: {len(coin_ids)} coins")
+                        
+                        # Small delay between pages
+                        if page < 3:
+                            await asyncio.sleep(1)
+                    else:
+                        logger.error(f"Market data API error on page {page}: {response.status}")
+                        break
+            
+            logger.info(f"Retrieved total {len(all_coin_ids)} top market cap coins")
+            return all_coin_ids
     except Exception as e:
-        logger.error(f"Error getting top gainers: {e}")
+        logger.error(f"Error getting top market cap coins: {e}")
         return []
 
-def create_section_message(section_type, new_tokens, all_tokens):
-    """Create message section for either trending or gainers"""
+async def get_coin_ath_data(coin_ids):
+    """Get detailed coin data including ATH information"""
+    ath_tokens = []
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Process coins in smaller batches to handle larger dataset
+            batch_size = 5  # Reduced from 10 to be more conservative with 300 coins
+            total_batches = len(coin_ids) // batch_size + (1 if len(coin_ids) % batch_size else 0)
+            
+            logger.info(f"Processing {len(coin_ids)} coins in {total_batches} batches of {batch_size}")
+            
+            for batch_num, i in enumerate(range(0, len(coin_ids), batch_size), 1):
+                batch = coin_ids[i:i + batch_size]
+                logger.info(f"Processing batch {batch_num}/{total_batches}")
+                
+                for coin_id in batch:
+                    try:
+                        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+                        params = {
+                            'localization': False,
+                            'tickers': False,
+                            'market_data': True,
+                            'community_data': False,
+                            'developer_data': False,
+                            'sparkline': False
+                        }
+                        
+                        async with session.get(url, params=params) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                market_data = data.get('market_data', {})
+                                
+                                # Get ATH date and current price info
+                                ath_date_str = market_data.get('ath_date', {}).get('usd')
+                                current_price = market_data.get('current_price', {}).get('usd', 0)
+                                ath_price = market_data.get('ath', {}).get('usd', 0)
+                                market_cap_rank = market_data.get('market_cap_rank', 0)
+                                market_cap = market_data.get('market_cap', {}).get('usd', 0)
+                                price_change_24h = market_data.get('price_change_percentage_24h', 0)
+                                
+                                if ath_date_str and current_price and ath_price and market_cap_rank:
+                                    # Parse ATH date
+                                    ath_date = datetime.fromisoformat(ath_date_str.replace('Z', '+00:00'))
+                                    now = datetime.now(timezone.utc)
+                                    hours_since_ath = (now - ath_date).total_seconds() / 3600
+                                    
+                                    # Check if ATH was within last 24 hours
+                                    if hours_since_ath <= 24:
+                                        # Calculate how close current price is to ATH
+                                        ath_percentage = (current_price / ath_price) * 100
+                                        
+                                        token_data = {
+                                            'id': coin_id,
+                                            'name': data.get('name', ''),
+                                            'symbol': data.get('symbol', '').upper(),
+                                            'rank': market_cap_rank,
+                                            'current_price': current_price,
+                                            'ath_price': ath_price,
+                                            'ath_date': ath_date,
+                                            'hours_since_ath': hours_since_ath,
+                                            'ath_percentage': ath_percentage,
+                                            'market_cap': market_cap,
+                                            'price_change_24h': price_change_24h
+                                        }
+                                        ath_tokens.append(token_data)
+                                        
+                            elif response.status == 429:
+                                logger.warning("Rate limit hit, waiting longer...")
+                                await asyncio.sleep(120)  # Wait 2 minutes on rate limit
+                            else:
+                                logger.warning(f"API error for {coin_id}: {response.status}")
+                        
+                        # Longer delay between requests for larger dataset
+                        await asyncio.sleep(2)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing {coin_id}: {e}")
+                        continue
+                
+                # Longer delay between batches for 300 coins
+                if batch_num < total_batches:
+                    logger.info(f"Completed batch {batch_num}/{total_batches}, waiting before next batch...")
+                    await asyncio.sleep(10)
+    
+    except Exception as e:
+        logger.error(f"Error getting coin ATH data: {e}")
+    
+    # Sort by market cap rank and take top 30
+    ath_tokens.sort(key=lambda x: x.get('rank', 999))
+    top_30_ath = ath_tokens[:30]
+    
+    logger.info(f"Found {len(ath_tokens)} total ATH tokens from top 300, showing top 30 by market cap")
+    return top_30_ath
+
+def create_ath_message(new_tokens, all_tokens):
+    """Create message for ATH tokens"""
     if not new_tokens:
         return ""
     
-    # Section header
-    if section_type == "trending":
-        section_header = f"📈 **NEW POSITIVE TRENDING TOKENS**\n🔥 {len(new_tokens)} NEW positive token(s) entered Trending!\n\n"
-    else:  # gainers
-        section_header = f"🚀 **NEW TOP GAINERS**\n💰 {len(new_tokens)} NEW token(s) entered Top 30 Gainers!\n\n"
-    
-    # Create position mapping based on section type
-    if section_type == "trending":
-        token_positions = {token['id']: token.get('trending_position', 999) for token in all_tokens}
-    else:
-        token_positions = {token['id']: token.get('gainer_position', 999) for token in all_tokens}
-    
-    # Sort new tokens by their position
-    new_tokens_with_position = []
-    for token in new_tokens:
-        position = token_positions.get(token['id'], 999)
-        new_tokens_with_position.append((position, token))
-    
-    new_tokens_with_position.sort(key=lambda x: x[0])
-    
-    section_content = ""
-    for position, token in new_tokens_with_position:
-        change_emoji = "🟢" if token.get('price_change', 0) > 0 else "🔴" if token.get('price_change', 0) < 0 else "⚪"
-        price = token.get('price', 0)
-        
-        section_content += f"**#{position} {token['name']}** ({token['symbol']})\n"
-        
-        if price > 0:
-            if price < 0.01:
-                price_str = f"${price:.6f}"
-            else:
-                price_str = f"${price:.2f}"
-            section_content += f"💰 Price: {price_str}\n"
-        
-        if token.get('price_change', 0) != 0:
-            section_content += f"{change_emoji} 24h Change: {token.get('price_change', 0):+.2f}%\n"
-        
-        if token.get('rank', 0) > 0:
-            section_content += f"🏆 Market Cap Rank: #{token.get('rank')}\n"
-        
-        section_content += "\n"
-    
-    return section_header + section_content
-
-def create_combined_message(new_trending, all_trending, new_gainers, all_gainers):
-    """Create combined notification message"""
-    if not new_trending and not new_gainers:
-        return ""
-    
     gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
-    total_new = len(new_trending) + len(new_gainers)
     
-    message = f"🎯 **CRYPTO MARKET CHANGES** 🎯\n"
+    message = f"🔥 **NEW ATH ACHIEVERS** 🔥\n"
     message += f"📅 {gmt8_time} GMT+8\n"
-    message += f"⚡ {total_new} NEW token(s) detected!\n\n"
+    message += f"🏆 {len(new_tokens)} NEW token(s) entered Top 30 ATH list!\n\n"
     
-    # Add trending section if there are new trending tokens
-    if new_trending:
-        trending_section = create_section_message("trending", new_trending, all_trending)
-        message += trending_section
+    # Sort new tokens by market cap rank
+    new_tokens.sort(key=lambda x: x.get('rank', 999))
+    
+    for token in new_tokens:
+        hours_ago = token.get('hours_since_ath', 0)
+        ath_percentage = token.get('ath_percentage', 0)
+        current_price = token.get('current_price', 0)
+        ath_price = token.get('ath_price', 0)
+        price_change_24h = token.get('price_change_24h', 0)
         
-        # Add separator if we have both sections
-        if new_gainers:
-            message += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    # Add gainers section if there are new gainers
-    if new_gainers:
-        gainers_section = create_section_message("gainers", new_gainers, all_gainers)
-        message += gainers_section
+        change_emoji = "🟢" if price_change_24h > 0 else "🔴" if price_change_24h < 0 else "⚪"
+        
+        message += f"**#{token['rank']} {token['name']}** ({token['symbol']})\n"
+        
+        # Current price
+        if current_price > 0:
+            if current_price < 0.01:
+                price_str = f"${current_price:.6f}"
+            else:
+                price_str = f"${current_price:.2f}"
+            message += f"💰 Current Price: {price_str}\n"
+        
+        # ATH price
+        if ath_price > 0:
+            if ath_price < 0.01:
+                ath_price_str = f"${ath_price:.6f}"
+            else:
+                ath_price_str = f"${ath_price:.2f}"
+            message += f"🏆 ATH Price: {ath_price_str}\n"
+        
+        # Time since ATH
+        if hours_ago < 1:
+            time_str = f"{int(hours_ago * 60)} minutes ago"
+        else:
+            time_str = f"{hours_ago:.1f} hours ago"
+        message += f"⏰ ATH Achieved: {time_str}\n"
+        
+        # Current vs ATH percentage
+        message += f"📊 Current vs ATH: {ath_percentage:.1f}%\n"
+        
+        # 24h change
+        if price_change_24h != 0:
+            message += f"{change_emoji} 24h Change: {price_change_24h:+.2f}%\n"
+        
+        # Market cap
+        if token.get('market_cap', 0) > 0:
+            market_cap_str = format_market_cap(token['market_cap'])
+            message += f"💎 Market Cap: {market_cap_str}\n"
+        
+        message += "\n"
     
     message += f"📊 Alert sent to {len(subscribers)} subscribers\n"
     message += f"⏰ Next check: Top of next hour (GMT+8)"
     
     return message
 
-def create_startup_report(trending_tokens, gainer_tokens):
-    """Create startup report showing both lists"""
+def format_market_cap(market_cap):
+    """Format market cap in readable format"""
+    if market_cap >= 1e12:
+        return f"${market_cap/1e12:.2f}T"
+    elif market_cap >= 1e9:
+        return f"${market_cap/1e9:.2f}B"
+    elif market_cap >= 1e6:
+        return f"${market_cap/1e6:.2f}M"
+    elif market_cap >= 1e3:
+        return f"${market_cap/1e3:.2f}K"
+    else:
+        return f"${market_cap:.2f}"
+
+def create_startup_report(ath_tokens):
+    """Create startup report showing current ATH tokens"""
     gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
     
-    message = f"🚀 **BOT STARTUP REPORT** 🚀\n"
+    message = f"🚀 **ATH MONITORING BOT STARTUP** 🚀\n"
     message += f"📅 {gmt8_time} GMT+8\n"
     message += f"✅ Bot deployed and monitoring successfully!\n\n"
     
-    # Trending section
-    if trending_tokens:
-        message += f"📈 **POSITIVE TRENDING TOKENS**\n"
-        message += f"🔥 Currently monitoring {len(trending_tokens)} positive trending tokens\n\n"
+    if ath_tokens:
+        message += f"🏆 **TOP 30 MARKET CAP TOKENS WITH 24H ATH**\n"
+        message += f"🔥 Currently monitoring {len(ath_tokens)} tokens that hit ATH in last 24h\n\n"
         
-        # Show top 10 trending
-        for token in trending_tokens[:10]:
-            if token.get('price_change', 0) > 0:
-                position = token.get('trending_position', '?')
-                price = token.get('price', 0)
-                
-                message += f"**#{position} {token['name']}** ({token['symbol']})\n"
-                
-                if price > 0:
-                    if price < 0.01:
-                        price_str = f"${price:.6f}"
-                    else:
-                        price_str = f"${price:.2f}"
-                    message += f"💰 Price: {price_str}\n"
-                
-                message += f"🟢 24h: +{token.get('price_change', 0):.2f}%\n"
-                message += "\n"
-        
-        if len(trending_tokens) > 10:
-            message += f"... and {len(trending_tokens) - 10} more positive trending tokens\n\n"
-    
-    message += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    # Gainers section
-    if gainer_tokens:
-        message += f"🚀 **TOP 30 GAINERS**\n"
-        message += f"💰 Currently monitoring {len(gainer_tokens)} top gainers\n\n"
-        
-        # Show top 10 gainers
-        for token in gainer_tokens[:10]:
-            position = token.get('gainer_position', '?')
-            change_emoji = "🟢" if token.get('price_change', 0) > 0 else "🔴" if token.get('price_change', 0) < 0 else "⚪"
-            price = token.get('price', 0)
+        # Show top 10
+        for token in ath_tokens[:10]:
+            hours_ago = token.get('hours_since_ath', 0)
+            ath_percentage = token.get('ath_percentage', 0)
+            current_price = token.get('current_price', 0)
             
-            message += f"**#{position} {token['name']}** ({token['symbol']})\n"
+            message += f"**#{token['rank']} {token['name']}** ({token['symbol']})\n"
             
-            if price > 0:
-                if price < 0.01:
-                    price_str = f"${price:.6f}"
+            if current_price > 0:
+                if current_price < 0.01:
+                    price_str = f"${current_price:.6f}"
                 else:
-                    price_str = f"${price:.2f}"
+                    price_str = f"${current_price:.2f}"
                 message += f"💰 Price: {price_str}\n"
             
-            message += f"{change_emoji} 24h: {token.get('price_change', 0):+.2f}%\n"
+            if hours_ago < 1:
+                time_str = f"{int(hours_ago * 60)}m ago"
+            else:
+                time_str = f"{hours_ago:.1f}h ago"
+            message += f"⏰ ATH: {time_str}\n"
+            message += f"📊 vs ATH: {ath_percentage:.1f}%\n"
             message += "\n"
         
-        if len(gainer_tokens) > 10:
-            message += f"... and {len(gainer_tokens) - 10} more gainers\n\n"
+        if len(ath_tokens) > 10:
+            message += f"... and {len(ath_tokens) - 10} more ATH tokens\n\n"
+    else:
+        message += f"ℹ️ **NO TOKENS WITH 24H ATH FOUND**\n"
+        message += f"🔍 Currently no tokens in top market cap have hit ATH in last 24h\n"
+        message += f"⏰ Will check again next hour\n\n"
     
     next_check_minutes = get_seconds_until_next_hour() / 60
     message += f"⏰ Next check: {next_check_minutes:.0f} minutes\n"
-    message += f"🎯 Will alert on changes to either list!\n"
+    message += f"🎯 Will alert when tokens enter/exit the ATH list!\n"
     message += f"📊 Ready to serve {len(subscribers)} subscribers"
     
     return message
@@ -259,84 +302,72 @@ async def send_notifications(bot, message):
 async def send_startup_report_to_admin(bot):
     """Send startup report to admin"""
     try:
-        trending_tokens = await get_trending_tokens()
-        gainer_tokens = await get_top_gainers()
+        coin_ids = await get_top_marketcap_coins()
+        ath_tokens = await get_coin_ath_data(coin_ids)
         
-        if trending_tokens or gainer_tokens:
-            startup_message = create_startup_report(trending_tokens, gainer_tokens)
-            
-            ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
-            
-            if ADMIN_CHAT_ID:
-                try:
-                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=startup_message, parse_mode='Markdown')
-                    logger.info(f"📊 Startup report sent to admin: {ADMIN_CHAT_ID}")
-                except Exception as e:
-                    logger.warning(f"Could not send startup report to admin: {e}")
-            elif subscribers:
-                first_subscriber = list(subscribers)[0]
-                try:
-                    await bot.send_message(chat_id=first_subscriber, text=startup_message, parse_mode='Markdown')
-                    logger.info(f"📊 Startup report sent to first subscriber: {first_subscriber}")
-                except Exception as e:
-                    logger.warning(f"Could not send startup report: {e}")
-            else:
-                logger.info("📊 Startup report ready (no subscribers to send to yet)")
-                logger.info(f"Monitoring: {len(trending_tokens)} trending + {len(gainer_tokens)} gainers")
+        startup_message = create_startup_report(ath_tokens)
+        
+        ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+        
+        if ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=startup_message, parse_mode='Markdown')
+                logger.info(f"📊 Startup report sent to admin: {ADMIN_CHAT_ID}")
+            except Exception as e:
+                logger.warning(f"Could not send startup report to admin: {e}")
+        elif subscribers:
+            first_subscriber = list(subscribers)[0]
+            try:
+                await bot.send_message(chat_id=first_subscriber, text=startup_message, parse_mode='Markdown')
+                logger.info(f"📊 Startup report sent to first subscriber: {first_subscriber}")
+            except Exception as e:
+                logger.warning(f"Could not send startup report: {e}")
+        else:
+            logger.info("📊 Startup report ready (no subscribers to send to yet)")
+            logger.info(f"Monitoring: {len(ath_tokens)} ATH tokens")
         
     except Exception as e:
         logger.error(f"Error sending startup report: {e}")
 
-async def check_both_lists(bot):
-    """Check for changes in both trending and gainers lists"""
-    global previous_trending_tokens, previous_gainer_tokens
+async def check_ath_tokens(bot):
+    """Check for changes in ATH tokens list"""
+    global previous_ath_tokens
     
     try:
-        # Get both lists
-        current_trending = await get_trending_tokens()
-        current_gainers = await get_top_gainers()
+        # Get top market cap coins and their ATH data
+        coin_ids = await get_top_marketcap_coins()
+        current_ath_tokens = await get_coin_ath_data(coin_ids)
         
-        current_trending_ids = {token['id'] for token in current_trending if token['id']}
-        current_gainer_ids = {token['id'] for token in current_gainers if token['id']}
+        current_ath_ids = {token['id'] for token in current_ath_tokens}
         
-        # Find new tokens in each list
-        new_trending_ids = current_trending_ids - previous_trending_tokens
-        new_gainer_ids = current_gainer_ids - previous_gainer_tokens
+        # Find new tokens that entered the ATH list
+        new_ath_ids = current_ath_ids - previous_ath_tokens
+        new_ath_tokens = [token for token in current_ath_tokens if token['id'] in new_ath_ids]
         
-        new_trending = [token for token in current_trending if token['id'] in new_trending_ids]
-        new_gainers = [token for token in current_gainers if token['id'] in new_gainer_ids]
-        
-        # Send notification if there are any changes
-        if (new_trending or new_gainers) and subscribers:
-            message = create_combined_message(new_trending, current_trending, new_gainers, current_gainers)
+        # Send notification if there are new ATH tokens
+        if new_ath_tokens and subscribers:
+            message = create_ath_message(new_ath_tokens, current_ath_tokens)
             
             if message:
                 await send_notifications(bot, message)
-                logger.info(f"🚨 ALERT: {len(new_trending)} new trending + {len(new_gainers)} new gainers!")
+                logger.info(f"🚨 ALERT: {len(new_ath_tokens)} new ATH tokens detected!")
                 
                 # Log details for debugging
-                if new_trending:
-                    for token in new_trending:
-                        position = token.get('trending_position', '?')
-                        logger.info(f"  NEW TRENDING #{position}: {token['name']} ({token['symbol']}) - +{token.get('price_change', 0):.2f}%")
-                
-                if new_gainers:
-                    for token in new_gainers:
-                        position = token.get('gainer_position', '?')
-                        logger.info(f"  NEW GAINER #{position}: {token['name']} ({token['symbol']}) - +{token.get('price_change', 0):.2f}%")
+                for token in new_ath_tokens:
+                    hours_ago = token.get('hours_since_ath', 0)
+                    logger.info(f"  NEW ATH: #{token['rank']} {token['name']} ({token['symbol']}) - ATH {hours_ago:.1f}h ago")
         else:
             gmt8_time = datetime.now(GMT8).strftime('%H:%M')
             if subscribers:
-                logger.info(f"✅ No changes at {gmt8_time} GMT+8. Both lists unchanged. ({len(subscribers)} subscribers)")
+                logger.info(f"✅ No changes at {gmt8_time} GMT+8. ATH list unchanged. ({len(subscribers)} subscribers)")
             else:
-                logger.info(f"ℹ️ No subscribers yet. Monitoring {len(current_trending_ids)} positive trending + {len(current_gainer_ids)} gainers.")
+                logger.info(f"ℹ️ No subscribers yet. Monitoring {len(current_ath_ids)} ATH tokens.")
         
         # Update previous tokens
-        previous_trending_tokens = current_trending_ids
-        previous_gainer_tokens = current_gainer_ids
+        previous_ath_tokens = current_ath_ids
         
     except Exception as e:
-        logger.error(f"Error in dual check: {e}")
+        logger.error(f"Error in ATH check: {e}")
 
 def get_seconds_until_next_hour():
     """Calculate seconds until next GMT+8 hour (XX:00:00)"""
@@ -361,19 +392,20 @@ async def handle_message(bot, update_data):
             gmt8_time = datetime.now(GMT8).strftime('%H:%M')
             next_check_minutes = get_seconds_until_next_hour() / 60
             
-            welcome = f"""🎯 **Welcome {user_name}!** 🎯
+            welcome = f"""🏆 **Welcome {user_name}!** 🏆
 
-✅ **You're now subscribed to DUAL crypto alerts!**
+✅ **You're now subscribed to ATH crypto alerts!**
 
 **What I monitor:**
-📈 Positive Trending tokens (NEW entries only!)
-🚀 Top 30 Gainers (NEW entries only!)
-⚡ Send alerts ONLY when NEW tokens enter either list
-🎯 Two sections: Changes in BOTH lists!
+🔥 Top 30 market cap tokens that hit ATH in last 24h
+⚡ Send alerts ONLY when NEW tokens enter the ATH list
+🏆 Track tokens that achieved new All-Time Highs recently
+📊 Show current price vs ATH percentage
 
 **How it works:**
-🔍 Check both lists every hour at XX:00 GMT+8
-📊 Alert you when tokens enter/exit either list
+🔍 Check top 300 market cap coins every hour at XX:00 GMT+8
+📈 Find tokens that hit ATH within last 24 hours
+🎯 Alert you when NEW tokens enter the top 30 ATH list
 🚫 Silent when nothing changes (no spam!)
 
 **Current Status:**
@@ -382,11 +414,11 @@ async def handle_message(bot, update_data):
 👥 Subscribers: {len(subscribers)}
 
 **Commands:**
-/start - Subscribe to dual alerts
+/start - Subscribe to ATH alerts
 /stop - Unsubscribe  
 /status - Check subscription
 
-**Double the insights, zero spam!** 📈🚀"""
+**Track the hottest performers! 🔥📈**"""
             
             await bot.send_message(chat_id=chat_id, text=welcome, parse_mode='Markdown')
             logger.info(f"New subscriber: {chat_id} ({user_name}) - Total: {len(subscribers)}")
@@ -395,7 +427,7 @@ async def handle_message(bot, update_data):
             subscribers.discard(chat_id)
             await bot.send_message(
                 chat_id=chat_id, 
-                text=f"👋 **Goodbye {user_name}!**\n\nYou're unsubscribed from dual crypto alerts.\nUse /start anytime to re-subscribe.\n\nThanks for using the bot! 🎯"
+                text=f"👋 **Goodbye {user_name}!**\n\nYou're unsubscribed from ATH crypto alerts.\nUse /start anytime to re-subscribe.\n\nThanks for using the bot! 🏆"
             )
             logger.info(f"Unsubscribed: {chat_id} - Remaining: {len(subscribers)}")
             
@@ -404,23 +436,22 @@ async def handle_message(bot, update_data):
             next_check_minutes = get_seconds_until_next_hour() / 60
             status = "✅ SUBSCRIBED" if chat_id in subscribers else "❌ NOT SUBSCRIBED"
             
-            status_msg = f"""🎯 **Dual Bot Status Report**
+            status_msg = f"""🏆 **ATH Bot Status Report**
 
 **Your Status:** {status}
 **Total Subscribers:** {len(subscribers)}
-**Monitoring:**
-  📈 {len(previous_trending_tokens)} Positive Trending tokens
-  🚀 {len(previous_gainer_tokens)} Top Gainers
+**Monitoring:** {len(previous_ath_tokens)} ATH tokens
 **Current Time:** {gmt8_time} GMT+8
 **Next Check:** {next_check_minutes:.0f} minutes
 
 **What We're Watching:**
-🔍 Positive Trending (NEW entries with actual trending rank)
-💰 Top 30 Gainers (NEW entries with actual gainer rank)
-⚡ NEW entries in either list
+🔍 Top 300 coins by market cap
+🏆 Tokens that hit ATH in last 24 hours
+📊 Top 30 by market cap ranking
+⚡ NEW entries in ATH list
 ⏰ Hourly checks at XX:00 GMT+8
 
-**Double coverage, maximum insights!** 📊🎯"""
+**Track the market's biggest winners! 🔥📈**"""
             
             await bot.send_message(chat_id=chat_id, text=status_msg, parse_mode='Markdown')
             
@@ -446,7 +477,7 @@ async def get_updates(bot, offset=0):
         return []
 
 async def main():
-    """Main function - Dual Tracking Focus"""
+    """Main function - ATH Monitoring Focus"""
     BOT_TOKEN = os.getenv('BOT_TOKEN')
     
     if not BOT_TOKEN:
@@ -457,13 +488,13 @@ async def main():
     
     # Log startup
     gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
-    logger.info(f"🎯 DUAL TRACKING Bot started at {gmt8_time} GMT+8")
-    logger.info(f"📈 Monitoring: Positive Trending + Top 30 Gainers")
-    logger.info(f"🎯 Focus: NEW entries only with actual positions!")
+    logger.info(f"🏆 ATH MONITORING Bot started at {gmt8_time} GMT+8")
+    logger.info(f"🔥 Monitoring: Top 30 market cap tokens with 24h ATH from top 300 coins")
+    logger.info(f"🎯 Focus: NEW ATH achievers only!")
     
     # Initial fetch to establish baseline
-    logger.info("🔍 Establishing baseline for both lists...")
-    await check_both_lists(bot)
+    logger.info("🔍 Establishing baseline for ATH tokens...")
+    await check_ath_tokens(bot)
     
     # Send startup report to verify bot is working
     logger.info("📊 Sending startup report...")
@@ -471,7 +502,7 @@ async def main():
     
     # Calculate when to do first hourly check
     seconds_to_next_hour = get_seconds_until_next_hour()
-    logger.info(f"⏰ Next dual check in {seconds_to_next_hour/60:.1f} minutes")
+    logger.info(f"⏰ Next ATH check in {seconds_to_next_hour/60:.1f} minutes")
     
     offset = 0
     last_hourly_check = 0
@@ -492,8 +523,8 @@ async def main():
             if (now_gmt8.minute == 0 and now_gmt8.second < 30 and 
                 current_time - last_hourly_check > 3500):  # At least 58+ minutes since last check
                 
-                logger.info(f"🕐 Dual check at {now_gmt8.strftime('%H:%M')} GMT+8")
-                await check_both_lists(bot)
+                logger.info(f"🕐 ATH check at {now_gmt8.strftime('%H:%M')} GMT+8")
+                await check_ath_tokens(bot)
                 last_hourly_check = current_time
             
             await asyncio.sleep(10)  # Check every 10 seconds for hourly timing
