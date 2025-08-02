@@ -1,9 +1,9 @@
 import os
 import asyncio
-import aiohttp
 import logging
 from datetime import datetime, timezone, timedelta
 from telegram import Bot
+import json
 
 # Enhanced storage for ATH tokens with cooldown tracking
 subscribers = set()
@@ -17,163 +17,164 @@ GMT8 = timezone(timedelta(hours=8))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# MCP CoinGecko client - You'll need to initialize this with your MCP setup
+# This is a placeholder - replace with your actual MCP client initialization
+coingecko_client = None  # Initialize your MCP CoinGecko client here
+
 async def get_top_marketcap_coins():
-    """Get top 3000 coins by market cap to check for ATH"""
+    """Get top 3000 coins by market cap using MCP CoinGecko tools"""
     try:
-        async with aiohttp.ClientSession() as session:
-            all_coin_ids = []
-            
-            # Get top 3000 coins (30 pages of 100 each)
-            total_pages = 30  # 3000 coins / 100 per page
-            
-            for page in range(1, total_pages + 1):
-                url = "https://api.coingecko.com/api/v3/coins/markets"
-                params = {
-                    'vs_currency': 'usd',
-                    'order': 'market_cap_desc',
-                    'per_page': 100,
-                    'page': page,
-                    'sparkline': False,
-                    'locale': 'en'
-                }
+        all_coin_data = []
+        
+        # Use MCP to get market data in batches
+        total_pages = 30  # 3000 coins / 100 per page
+        
+        for page in range(1, total_pages + 1):
+            try:
+                # Using MCP CoinGecko get_coins_markets
+                result = await coingecko_client.call_tool(
+                    "coingecko:get_coins_markets",
+                    {
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": 100,
+                        "page": page,
+                        "sparkline": False,
+                        "price_change_percentage": "24h"
+                    }
+                )
                 
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        coin_ids = [coin['id'] for coin in data if coin.get('market_cap_rank')]
-                        all_coin_ids.extend(coin_ids)
-                        logger.info(f"Retrieved page {page}/{total_pages}: {len(coin_ids)} coins (Total: {len(all_coin_ids)})")
-                        
-                        # Progressive delay - longer delays for later pages to avoid rate limits
-                        if page < total_pages:
-                            if page <= 10:
-                                await asyncio.sleep(1)  # 1 second for first 10 pages
-                            elif page <= 20:
-                                await asyncio.sleep(2)  # 2 seconds for pages 11-20
-                            else:
-                                await asyncio.sleep(3)  # 3 seconds for pages 21-30
+                if result and isinstance(result, list):
+                    all_coin_data.extend(result)
+                    logger.info(f"Retrieved page {page}/{total_pages}: {len(result)} coins (Total: {len(all_coin_data)})")
+                else:
+                    logger.warning(f"No data returned for page {page}")
+                
+                # Rate limiting - progressive delay
+                if page < total_pages:
+                    if page <= 10:
+                        await asyncio.sleep(1)
+                    elif page <= 20:
+                        await asyncio.sleep(2)
                     else:
-                        logger.error(f"Market data API error on page {page}: {response.status}")
-                        if response.status == 429:
-                            logger.warning("Rate limit hit, waiting 2 minutes...")
-                            await asyncio.sleep(120)
-                            continue
-                        break
-            
-            logger.info(f"✅ Retrieved total {len(all_coin_ids)} top market cap coins for ATH monitoring")
-            return all_coin_ids
+                        await asyncio.sleep(3)
+                        
+            except Exception as e:
+                logger.error(f"Error getting page {page}: {e}")
+                # If we hit rate limits, wait longer
+                if "429" in str(e) or "rate" in str(e).lower():
+                    logger.warning("Rate limit hit, waiting 2 minutes...")
+                    await asyncio.sleep(120)
+                    continue
+                break
+        
+        logger.info(f"✅ Retrieved total {len(all_coin_data)} coins for ATH monitoring")
+        return all_coin_data
+    
     except Exception as e:
         logger.error(f"Error getting top market cap coins: {e}")
         return []
 
-async def get_coin_ath_data(coin_ids):
-    """Get detailed coin data including ATH information for 3000 coins - Returns ALL ATH tokens"""
+async def get_coin_ath_data(coins_data):
+    """Get detailed coin data including ATH information using MCP"""
     ath_tokens = []
     
     try:
-        async with aiohttp.ClientSession() as session:
-            # Process coins in smaller batches with better rate limiting for 3000 coins
-            batch_size = 3  # Reduced to 3 for better reliability with larger dataset
-            total_batches = len(coin_ids) // batch_size + (1 if len(coin_ids) % batch_size else 0)
-            
-            logger.info(f"🔍 Processing {len(coin_ids)} coins in {total_batches} batches of {batch_size}")
-            logger.info(f"⏱️ Estimated time: {(total_batches * batch_size * 3) / 60:.1f} minutes")
-            
-            processed = 0
-            
-            for batch_num, i in enumerate(range(0, len(coin_ids), batch_size), 1):
-                batch = coin_ids[i:i + batch_size]
+        total_coins = len(coins_data)
+        processed = 0
+        
+        logger.info(f"🔍 Processing {total_coins} coins for ATH data")
+        
+        for coin in coins_data:
+            try:
+                coin_id = coin.get('id')
+                if not coin_id:
+                    processed += 1
+                    continue
                 
                 # Progress logging every 100 coins
                 if processed % 100 == 0:
-                    logger.info(f"📊 Progress: {processed}/{len(coin_ids)} coins processed ({processed/len(coin_ids)*100:.1f}%)")
+                    logger.info(f"📊 Progress: {processed}/{total_coins} coins processed ({processed/total_coins*100:.1f}%)")
                 
-                for coin_id in batch:
-                    try:
-                        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-                        params = {
-                            'localization': False,
-                            'tickers': False,
-                            'market_data': True,
-                            'community_data': False,
-                            'developer_data': False,
-                            'sparkline': False
-                        }
-                        
-                        async with session.get(url, params=params) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                market_data = data.get('market_data', {})
-                                
-                                # Get ATH date and current price info
-                                ath_date_str = market_data.get('ath_date', {}).get('usd')
-                                current_price = market_data.get('current_price', {}).get('usd', 0)
-                                ath_price = market_data.get('ath', {}).get('usd', 0)
-                                market_cap_rank = market_data.get('market_cap_rank', 0)
-                                market_cap = market_data.get('market_cap', {}).get('usd', 0)
-                                price_change_24h = market_data.get('price_change_percentage_24h', 0)
-                                
-                                if ath_date_str and current_price and ath_price and market_cap_rank:
-                                    # Parse ATH date
-                                    ath_date = datetime.fromisoformat(ath_date_str.replace('Z', '+00:00'))
-                                    now = datetime.now(timezone.utc)
-                                    hours_since_ath = (now - ath_date).total_seconds() / 3600
-                                    
-                                    # Check if ATH was within last 24 hours
-                                    if hours_since_ath <= 24:
-                                        # Calculate how close current price is to ATH
-                                        ath_percentage = (current_price / ath_price) * 100
-                                        
-                                        token_data = {
-                                            'id': coin_id,
-                                            'name': data.get('name', ''),
-                                            'symbol': data.get('symbol', '').upper(),
-                                            'rank': market_cap_rank,
-                                            'current_price': current_price,
-                                            'ath_price': ath_price,
-                                            'ath_date': ath_date,
-                                            'hours_since_ath': hours_since_ath,
-                                            'ath_percentage': ath_percentage,
-                                            'market_cap': market_cap,
-                                            'price_change_24h': price_change_24h
-                                        }
-                                        ath_tokens.append(token_data)
-                                        
-                            elif response.status == 429:
-                                logger.warning("⚠️ Rate limit hit, waiting 3 minutes...")
-                                await asyncio.sleep(180)  # Wait 3 minutes on rate limit
-                            else:
-                                logger.warning(f"API error for {coin_id}: {response.status}")
-                        
-                        processed += 1
-                        
-                        # Dynamic delay based on progress to maintain rate limits
-                        if processed <= 1000:
-                            await asyncio.sleep(2.5)  # 2.5s for first 1000
-                        elif processed <= 2000:
-                            await asyncio.sleep(3)    # 3s for coins 1001-2000
-                        else:
-                            await asyncio.sleep(3.5)  # 3.5s for coins 2001-3000
-                        
-                    except Exception as e:
-                        logger.warning(f"Error processing {coin_id}: {e}")
-                        processed += 1
-                        continue
+                # Get detailed coin data using MCP
+                result = await coingecko_client.call_tool(
+                    "coingecko:get_id_coins",
+                    {
+                        "id": coin_id,
+                        "localization": False,
+                        "tickers": False,
+                        "market_data": True,
+                        "community_data": False,
+                        "developer_data": False,
+                        "sparkline": False
+                    }
+                )
                 
-                # Longer delay between batches with progress-based scaling
-                if batch_num < total_batches:
-                    batch_delay = 15 if processed <= 1500 else 20
-                    if batch_num % 50 == 0:  # Every 50 batches, log progress
-                        logger.info(f"🔄 Batch {batch_num}/{total_batches} complete. Found {len(ath_tokens)} ATH tokens so far...")
-                    await asyncio.sleep(batch_delay)
+                if result and 'market_data' in result:
+                    market_data = result['market_data']
+                    
+                    # Get ATH date and current price info
+                    ath_date_str = market_data.get('ath_date', {}).get('usd')
+                    current_price = market_data.get('current_price', {}).get('usd', 0)
+                    ath_price = market_data.get('ath', {}).get('usd', 0)
+                    market_cap_rank = market_data.get('market_cap_rank', 0)
+                    market_cap = market_data.get('market_cap', {}).get('usd', 0)
+                    price_change_24h = market_data.get('price_change_percentage_24h', 0)
+                    
+                    if ath_date_str and current_price and ath_price and market_cap_rank:
+                        # Parse ATH date
+                        ath_date = datetime.fromisoformat(ath_date_str.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        hours_since_ath = (now - ath_date).total_seconds() / 3600
+                        
+                        # Check if ATH was within last 24 hours
+                        if hours_since_ath <= 24:
+                            # Calculate how close current price is to ATH
+                            ath_percentage = (current_price / ath_price) * 100
+                            
+                            token_data = {
+                                'id': coin_id,
+                                'name': result.get('name', ''),
+                                'symbol': result.get('symbol', '').upper(),
+                                'rank': market_cap_rank,
+                                'current_price': current_price,
+                                'ath_price': ath_price,
+                                'ath_date': ath_date,
+                                'hours_since_ath': hours_since_ath,
+                                'ath_percentage': ath_percentage,
+                                'market_cap': market_cap,
+                                'price_change_24h': price_change_24h
+                            }
+                            ath_tokens.append(token_data)
+                
+                processed += 1
+                
+                # Dynamic delay based on progress to maintain rate limits
+                if processed <= 1000:
+                    await asyncio.sleep(2.5)
+                elif processed <= 2000:
+                    await asyncio.sleep(3)
+                else:
+                    await asyncio.sleep(3.5)
+                
+            except Exception as e:
+                logger.warning(f"Error processing {coin.get('id', 'unknown')}: {e}")
+                processed += 1
+                
+                # Handle rate limits
+                if "429" in str(e) or "rate" in str(e).lower():
+                    logger.warning("⚠️ Rate limit hit, waiting 3 minutes...")
+                    await asyncio.sleep(180)
+                
+                continue
     
     except Exception as e:
         logger.error(f"Error getting coin ATH data: {e}")
     
-    # Sort by market cap rank for display purposes, but return ALL ATH tokens
+    # Sort by market cap rank for display purposes
     ath_tokens.sort(key=lambda x: x.get('rank', 999))
     
-    logger.info(f"🏆 Found {len(ath_tokens)} total ATH tokens from top 3000 coins")
+    logger.info(f"🏆 Found {len(ath_tokens)} total ATH tokens")
     return ath_tokens
 
 def clean_old_cooldowns():
@@ -231,10 +232,10 @@ def create_ath_message(new_tokens, total_ath_count):
     message = f"🔥 **NEW ATH ACHIEVERS DETECTED** 🔥\n"
     message += f"📅 {gmt8_time} GMT+8\n"
     message += f"🆕 **{len(new_tokens)}** NEW tokens hit ATH (not alerted in last 24h)\n"
-    message += f"📊 Total ATH tokens found: **{total_ath_count}** from 3000 coins\n"
-    message += f"🌐 Monitored from top 3000 market cap coins\n\n"
+    message += f"📊 Total ATH tokens found: **{total_ath_count}**\n"
+    message += f"🌐 Monitored from top market cap coins\n\n"
     
-    # Show all new tokens (no limit to 30 since we want all changes)
+    # Show all new tokens
     for i, token in enumerate(new_tokens, 1):
         hours_ago = token.get('hours_since_ath', 0)
         ath_percentage = token.get('ath_percentage', 0)
@@ -298,7 +299,7 @@ def create_no_changes_message(total_ath_count):
     if total_ath_count == 0:
         message = f"😴 **NO ATH TOKENS FOUND** 😴\n"
         message += f"📅 {gmt8_time} GMT+8\n"
-        message += f"🔍 No tokens among top 3000 coins hit ATH in last 24h\n"
+        message += f"🔍 No tokens hit ATH in last 24h\n"
         message += f"💤 Market is consolidating - no new ATH achievers\n"
         message += f"⏰ Will check again next hour"
     else:
@@ -331,8 +332,8 @@ async def send_immediate_test_post(bot):
 📅 {gmt8_time} GMT+8
 ✅ **ATH Monitoring Bot is LIVE!**
 
-🔧 **Enhanced Configuration:**
-🌐 Monitoring: TOP 3000 market cap coins
+🔧 **Configuration:**
+🌐 Monitoring: Market cap coins via CoinGecko MCP
 🏆 Tracking: ALL tokens that hit ATH in last 24h
 🆕 Alerts: ONLY new/changed ATH tokens (no spam)
 🔕 Cooldown: 24h per token (avoid repeated alerts)
@@ -388,12 +389,12 @@ def create_startup_report(ath_tokens):
     message = f"🚀 **ATH MONITORING BOT STARTUP COMPLETE** 🚀\n"
     message += f"📅 {gmt8_time} GMT+8\n"
     message += f"✅ Bot deployed and monitoring successfully!\n"
-    message += f"🌐 **ENHANCED MONITORING**: Tracking ALL ATH changes from 3000 coins!\n\n"
+    message += f"🌐 **MONITORING**: Tracking ATH changes via CoinGecko MCP!\n\n"
     
     if ath_tokens:
         message += f"🏆 **BASELINE ESTABLISHED**\n"
         message += f"📊 Found **{len(ath_tokens)}** tokens that hit ATH in last 24h\n"
-        message += f"🔍 Scanned top 3000 market cap coins\n"
+        message += f"🔍 Scanned market cap coins\n"
         message += f"🔕 All current ATH tokens added to cooldown list\n\n"
         
         # Show top 15 as sample
@@ -421,7 +422,7 @@ def create_startup_report(ath_tokens):
             message += f"... and {len(ath_tokens) - 15} more ATH tokens\n\n"
     else:
         message += f"ℹ️ **NO ATH TOKENS FOUND**\n"
-        message += f"🔍 No tokens in top 3000 coins hit ATH in last 24h\n"
+        message += f"🔍 No tokens hit ATH in last 24h\n"
         message += f"💤 Market is consolidating - ready to catch next ATH wave\n\n"
     
     next_check_minutes = get_seconds_until_next_hour() / 60
@@ -456,8 +457,8 @@ async def send_notifications(bot, message):
 async def send_startup_report_to_admin(bot):
     """Send startup report to admin"""
     try:
-        coin_ids = await get_top_marketcap_coins()
-        ath_tokens = await get_coin_ath_data(coin_ids)
+        coins_data = await get_top_marketcap_coins()
+        ath_tokens = await get_coin_ath_data(coins_data)
         
         # Initialize cooldowns for all current ATH tokens
         now = datetime.now(timezone.utc)
@@ -483,7 +484,7 @@ async def send_startup_report_to_admin(bot):
                 logger.warning(f"Could not send startup report: {e}")
         else:
             logger.info("📊 Startup report ready (no subscribers to send to yet)")
-            logger.info(f"Baseline: {len(ath_tokens)} ATH tokens from 3000 coins")
+            logger.info(f"Baseline: {len(ath_tokens)} ATH tokens")
         
     except Exception as e:
         logger.error(f"Error sending startup report: {e}")
@@ -494,9 +495,9 @@ async def check_ath_tokens(bot):
         # Clean old cooldowns first
         clean_old_cooldowns()
         
-        # Get all current ATH tokens from 3000 coins
-        coin_ids = await get_top_marketcap_coins()
-        all_current_ath_tokens = await get_coin_ath_data(coin_ids)
+        # Get all current ATH tokens
+        coins_data = await get_top_marketcap_coins()
+        all_current_ath_tokens = await get_coin_ath_data(coins_data)
         
         # Filter out tokens that are in cooldown period
         new_ath_tokens = filter_new_ath_tokens(all_current_ath_tokens)
@@ -512,7 +513,7 @@ async def check_ath_tokens(bot):
             message = create_ath_message(new_ath_tokens, len(all_current_ath_tokens))
             if message and subscribers:
                 await send_notifications(bot, message)
-                logger.info(f"🚨 ALERT: {len(new_ath_tokens)} new ATH tokens detected from 3000 coin scan!")
+                logger.info(f"🚨 ALERT: {len(new_ath_tokens)} new ATH tokens detected!")
                 
                 # Log details for debugging
                 for token in new_ath_tokens[:5]:  # Show first 5 in logs
@@ -565,14 +566,14 @@ async def handle_message(bot, update_data):
 ✅ **You're now subscribed to SMART ATH crypto alerts!**
 
 **🧠 INTELLIGENT MONITORING:**
-🌐 **TOP 3000** market cap tokens (maximum coverage!)
-🆕 Alert on **ALL NEW** ATH tokens (no top 30 limit)
+🌐 Market cap tokens via **CoinGecko MCP**
+🆕 Alert on **ALL NEW** ATH tokens
 🔕 **24-hour cooldown** per token (no spam)
 📊 Always show total ATH count vs new changes
 ⚡ Alert ONLY on changes, not repeats
 
 **How the smart system works:**
-🔍 Check top **3000 coins** every hour at XX:00 GMT+8
+🔍 Check top coins every hour at XX:00 GMT+8
 📈 Find ALL tokens that hit ATH within last 24 hours
 🆕 Alert you ONLY on tokens not alerted in last 24h
 🔕 Skip tokens already alerted (24h cooldown)
@@ -584,7 +585,7 @@ async def handle_message(bot, update_data):
 ⏰ Next check: {next_check_minutes:.0f} minutes
 👥 Subscribers: {len(subscribers)}
 🔕 Cooldowns: {len(ath_cooldowns)} tokens
-🌐 **Monitoring: 3000 coins intelligently!**
+🌐 **Monitoring via CoinGecko MCP!**
 
 **Commands:**
 /start - Subscribe to smart ATH alerts
@@ -622,9 +623,9 @@ async def handle_message(bot, update_data):
 **Next Check:** {next_check_minutes:.0f} minutes
 
 **🧠 SMART MONITORING STATUS:**
-🌐 **TOP 3000** coins by market cap
+🌐 **CoinGecko MCP** integration
 🔕 **{active_cooldowns}** tokens in 24h cooldown
-🆕 Tracking: ALL new ATH tokens (no limit)
+🆕 Tracking: ALL new ATH tokens
 ⚡ Alert: ONLY on changes (no spam)
 ⏰ Hourly checks at XX:00 GMT+8
 
@@ -641,11 +642,54 @@ async def handle_message(bot, update_data):
     except Exception as e:
         logger.error(f"Error handling message: {e}")
 
+# MCP Client Integration - You need to implement this part
+class MCPCoinGeckoClient:
+    """
+    MCP CoinGecko client wrapper
+    Replace this with your actual MCP client implementation
+    """
+    def __init__(self):
+        # Initialize your MCP client here
+        # This depends on your MCP setup
+        pass
+    
+    async def call_tool(self, tool_name, parameters):
+        """
+        Call MCP CoinGecko tool
+        Replace this with your actual MCP client call
+        """
+        # Example implementation - replace with your actual MCP client
+        try:
+            # This is a placeholder - implement your actual MCP client call here
+            # Your MCP client should handle the tool calls to CoinGecko
+            
+            if tool_name == "coingecko:get_coins_markets":
+                # Return mock data or implement actual MCP call
+                logger.warning("MCP client not implemented - using placeholder")
+                return []
+            
+            elif tool_name == "coingecko:get_id_coins":
+                # Return mock data or implement actual MCP call
+                logger.warning("MCP client not implemented - using placeholder")
+                return {}
+            
+            else:
+                logger.error(f"Unknown tool: {tool_name}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"MCP tool call error: {e}")
+            return None
+
 async def get_updates(bot, offset=0):
     """Get updates from Telegram"""
     try:
         url = f"https://api.telegram.org/bot{bot.token}/getUpdates"
         params = {'offset': offset, 'timeout': 10}
+        
+        # You'll need to implement HTTP client here since we removed aiohttp
+        # or add aiohttp back as a dependency
+        import aiohttp
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params) as response:
@@ -660,28 +704,32 @@ async def get_updates(bot, offset=0):
         return []
 
 async def main():
-    """Main function - Smart ATH Change Monitoring for 3000 Coins"""
+    """Main function - Smart ATH Change Monitoring using MCP"""
+    global coingecko_client
+    
     BOT_TOKEN = os.getenv('BOT_TOKEN')
     
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN environment variable not set!")
         return
     
+    # Initialize MCP CoinGecko client
+    coingecko_client = MCPCoinGeckoClient()
+    
     bot = Bot(token=BOT_TOKEN)
     
     # Log startup
     gmt8_time = datetime.now(GMT8).strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f"🏆 SMART ATH MONITORING Bot started at {gmt8_time} GMT+8")
-    logger.info(f"🧠 INTELLIGENT SYSTEM: Track ALL ATH changes from 3000 coins with 24h cooldown!")
+    logger.info(f"🧠 INTELLIGENT SYSTEM: Track ATH changes via CoinGecko MCP with 24h cooldown!")
     logger.info(f"🎯 Focus: NEW ATH tokens only, no spam, smart alerts!")
     
     # IMMEDIATE TEST POST - Send right away to confirm bot is working
     logger.info("📤 Sending immediate test post...")
     await send_immediate_test_post(bot)
     
-    # Initial fetch to establish baseline (this will take much longer now)
-    logger.info("🔍 Establishing ATH baseline from 3000 coins...")
-    logger.info("⏳ This initial scan will take approximately 2.5-3 hours due to rate limits...")
+    # Initial fetch to establish baseline
+    logger.info("🔍 Establishing ATH baseline via MCP...")
     await send_startup_report_to_admin(bot)
     
     # Calculate when to do first hourly check
@@ -708,7 +756,7 @@ async def main():
                 current_time - last_hourly_check > 3500):  # At least 58+ minutes since last check
                 
                 logger.info(f"🕐 Smart ATH change check starting at {now_gmt8.strftime('%H:%M')} GMT+8")
-                logger.info("⏳ Scanning 3000 coins for ATH changes (2.5-3 hours)...")
+                logger.info("⏳ Scanning coins for ATH changes via MCP...")
                 await check_ath_tokens(bot)
                 last_hourly_check = current_time
             
@@ -722,4 +770,31 @@ async def main():
             await asyncio.sleep(30)  # Wait before retry
 
 if __name__ == "__main__":
+    print("""
+🚨 IMPORTANT: MCP CLIENT SETUP REQUIRED 🚨
+
+This code has been converted to use CoinGecko MCP tools, but you need to:
+
+1. Implement the MCPCoinGeckoClient class with your actual MCP client
+2. Replace the placeholder tool calls with real MCP calls
+3. Set up your MCP server connection
+4. Install required dependencies:
+   - pip install python-telegram-bot aiohttp
+
+📋 Required MCP Tools:
+- coingecko:get_coins_markets (for getting market data)
+- coingecko:get_id_coins (for detailed coin data including ATH)
+
+🔧 Environment Variables Needed:
+- BOT_TOKEN (Telegram bot token)
+- ADMIN_CHAT_ID (optional, for admin notifications)
+
+💡 The main changes from your original code:
+- Removed direct API calls to CoinGecko REST API
+- Added MCP tool calls via MCPCoinGeckoClient
+- Maintained all the smart cooldown and filtering logic
+- Kept the same Telegram bot functionality
+
+Please implement the MCP client integration and then run the bot!
+""")
     asyncio.run(main())
