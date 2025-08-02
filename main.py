@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 import pytz
 
 # Configuration - Replace these with your actual values
-TELEGRAM_BOT_TOKEN = "8359324368:AAHgi3n2xTSyB5trTnd456CHa7_Ad2U2vsY"
-TELEGRAM_CHAT_ID = "81589364"
-COINGECKO_API_KEY = "CG-N6zCRMeBS6jnx2WnMFUgpB1t"
+TELEGRAM_BOT_TOKEN = os.getenv("8359324368:AAHgi3n2xTSyB5trTnd456CHa7_Ad2U2vsY")
+TELEGRAM_CHAT_ID = os.getenv("81589364")
+COINGECKO_API_KEY = os.getenv("CG-N6zCRMeBS6jnx2WnMFUgpB1t")
 
 # File to store tokens that already hit ATH in last 24h
 SENT_TOKENS_FILE = "sent_tokens.json"
