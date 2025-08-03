@@ -5,10 +5,10 @@ import os
 from datetime import datetime, timedelta
 import pytz
 
-# Configuration - Set these as environment variables
-TELEGRAM_BOT_TOKEN = os.getenv("8359324368:AAHgi3n2xTSyB5trTnd456CHa7_Ad2U2vsY")  # Set your bot token here
-TELEGRAM_CHAT_ID = os.getenv("81589364")     # Set your chat ID here
-COINGECKO_API_KEY = os.getenv("CG-N6zCRMeBS6jnx2WnMFUgpB1t")   # Set your CoinGecko API key here
+# Configuration - Set these as environment variables in Railway
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Set your bot token here
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # Set your chat ID here
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")   # Set your CoinGecko API key here
 
 # File to store tokens that already hit ATH in last 24h
 SENT_TOKENS_FILE = "sent_tokens.json"
@@ -276,11 +276,11 @@ def test_credentials():
 
 def main():
     """Main function to run the bot"""
-    print("🤖 ATH Monitor Bot Starting...")
+    print("🤖 ATH Monitor Bot Starting on Railway...")
     
     # Test credentials first
     if not test_credentials():
-        print("❌ Credential test failed. Please check your environment variables.")
+        print("❌ Credential test failed. Please check your Railway environment variables.")
         return
     
     # Set timezone to GMT+8
@@ -288,21 +288,46 @@ def main():
     
     # Send startup message
     startup_time = datetime.now(gmt8).strftime("%Y-%m-%d %H:%M:%S GMT+8")
-    send_telegram_message(f"🤖 ATH Monitor Bot started at {startup_time}")
+    send_telegram_message(f"🤖 ATH Monitor Bot started on Railway at {startup_time}")
     
-    main_interval = 1800  # 30 minutes for more frequent checks with Pro API
+    main_interval = 3600  # 1 hour schedule
     
+    # FIRST RUN - Execute immediately to test
+    print(f"\n{'='*60}")
+    print(f"🚀 INITIAL TEST RUN - Running immediately to verify bot works")
+    print(f"{'='*60}")
+    
+    try:
+        current_time = datetime.now(gmt8)
+        print(f"🕐 Test run at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
+        
+        check_ath_tokens()
+        
+        print(f"✅ Initial test completed successfully!")
+        print(f"🔄 Bot will now run every {main_interval//60} minutes")
+        send_telegram_message(f"✅ Initial test completed! Bot is working on Railway and will check every {main_interval//60} minutes.")
+        
+    except Exception as e:
+        error_msg = f"❌ Initial test failed: {e}"
+        print(error_msg)
+        send_telegram_message(f"❌ Initial test failed: {str(e)[:100]}...")
+        print("🛑 Stopping bot due to initial test failure")
+        return
+    
+    # Continue with regular schedule
     while True:
         try:
+            print(f"\n⏰ Waiting {main_interval//60} minutes until next check...")
+            time.sleep(main_interval)
+            
             current_time = datetime.now(gmt8)
             print(f"\n{'='*50}")
-            print(f"🕐 Running check at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
+            print(f"🕐 Scheduled check at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
             print(f"{'='*50}")
             
             check_ath_tokens()
             
-            print(f"✅ Check completed. Waiting {main_interval//60} minutes for next check...")
-            time.sleep(main_interval)
+            print(f"✅ Scheduled check completed.")
             
         except KeyboardInterrupt:
             print("\n👋 Bot stopped by user")
@@ -318,16 +343,12 @@ def main():
             time.sleep(300)
 
 if __name__ == "__main__":
-    # Print setup instructions
-    print("📋 Setup Instructions for Pro API:")
-    print("Set these environment variables:")
-    print("export TELEGRAM_BOT_TOKEN='your_bot_token'")
-    print("export TELEGRAM_CHAT_ID='your_chat_id'") 
-    print("export COINGECKO_API_KEY='your_pro_api_key'  # Pro API Key Required")
-    print("\nPro API Benefits:")
-    print("✅ 10,000-50,000 calls/month (vs 100/month free)")
-    print("✅ 50 calls/minute (vs 10-30/minute free)")
-    print("✅ Checking up to 5,000 coins every 30 minutes")
+    # Print Railway deployment info
+    print("🚂 Railway ATH Monitor Bot")
+    print("📋 Required Railway Environment Variables:")
+    print("- TELEGRAM_BOT_TOKEN")
+    print("- TELEGRAM_CHAT_ID") 
+    print("- COINGECKO_API_KEY")
     print("-" * 50)
     
     main()
