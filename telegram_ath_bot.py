@@ -5,10 +5,10 @@ import os
 from datetime import datetime, timedelta
 import pytz
 
-# Configuration - Replace these with your actual values
-TELEGRAM_BOT_TOKEN = os.getenv("8359324368:AAHgi3n2xTSyB5trTnd456CHa7_Ad2U2vsY")
-TELEGRAM_CHAT_ID = os.getenv("81589364")
-COINGECKO_API_KEY = os.getenv("CG-N6zCRMeBS6jnx2WnMFUgpB1t")
+# Configuration - Set these as environment variables
+TELEGRAM_BOT_TOKEN = os.getenv("8359324368:AAHgi3n2xTSyB5trTnd456CHa7_Ad2U2vsY")  # Set your bot token here
+TELEGRAM_CHAT_ID = os.getenv("81589364")     # Set your chat ID here
+COINGECKO_API_KEY = os.getenv("CG-N6zCRMeBS6jnx2WnMFUgpB1t")   # Set your CoinGecko API key here
 
 # File to store tokens that already hit ATH in last 24h
 SENT_TOKENS_FILE = "sent_tokens.json"
@@ -29,7 +29,7 @@ def save_sent_tokens(sent_tokens):
     """Save the list of tokens we've sent notifications for"""
     try:
         with open(SENT_TOKENS_FILE, 'w') as f:
-            json.dump(sent_tokens, f)
+            json.dump(sent_tokens, f, indent=2)
     except Exception as e:
         print(f"Error saving sent tokens: {e}")
 
@@ -50,6 +50,10 @@ def clean_old_entries(sent_tokens):
 
 def send_telegram_message(message):
     """Send a message to Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: Telegram credentials not set!")
+        return False
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -58,77 +62,93 @@ def send_telegram_message(message):
     }
     
     try:
-        response = requests.post(url, data=data)
+        response = requests.post(url, data=data, timeout=30)
         if response.status_code == 200:
-            print("Message sent successfully")
+            print("✅ Message sent successfully")
             return True
         else:
-            print(f"Failed to send message: {response.text}")
+            print(f"❌ Failed to send message: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        print(f"Error sending message: {e}")
+        print(f"❌ Error sending message: {e}")
         return False
 
-def get_top_coins_data():
-    """Fetch top 3000 coins from CoinGecko"""
+def get_top_coins_data(max_coins=5000):
+    """Fetch top coins from CoinGecko with Pro API optimization"""
     url = "https://api.coingecko.com/api/v3/coins/markets"
     
     headers = {
         "accept": "application/json",
-        "x-cg-demo-api-key": COINGECKO_API_KEY
+        "x-cg-pro-api-key": COINGECKO_API_KEY  # Pro API key header
     }
     
     all_coins = []
+    per_page = 250
+    max_pages = max_coins // per_page  # Up to 20 pages (5000 coins) for pro tier
     
-    # CoinGecko API returns max 250 coins per page, so we need multiple requests
-    for page in range(1, 13):  # 12 pages * 250 = 3000 coins
+    print(f"📊 Fetching top {max_pages * per_page} coins with Pro API...")
+    
+    for page in range(1, max_pages + 1):
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": 250,
+            "per_page": per_page,
             "page": page,
             "sparkline": False,
             "price_change_percentage": "24h"
         }
         
         try:
-            print(f"Fetching page {page}...")
-            response = requests.get(url, headers=headers, params=params)
+            print(f"📄 Fetching page {page}/{max_pages}...")
+            response = requests.get(url, headers=headers, params=params, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
+                print(f"✅ Page {page}: Got {len(data)} coins")
                 all_coins.extend(data)
-                time.sleep(1)  # Rate limiting - wait 1 second between requests
+                
+                # Minimal delay for Pro API - much higher rate limits
+                if page < max_pages:
+                    time.sleep(0.1)  # Very short delay for Pro API
+                    
+            elif response.status_code == 429:
+                print(f"⚠️ Rate limited on page {page}. Waiting 10 seconds...")
+                time.sleep(10)
+                continue
             else:
-                print(f"Error fetching page {page}: {response.status_code}")
+                print(f"❌ Error fetching page {page}: {response.status_code} - {response.text}")
                 break
                 
         except Exception as e:
-            print(f"Error fetching page {page}: {e}")
+            print(f"❌ Error fetching page {page}: {e}")
             break
     
+    print(f"📊 Total coins fetched: {len(all_coins)}")
     return all_coins
 
 def check_ath_tokens():
     """Check for tokens that hit ATH in the last 24 hours"""
-    print("Checking for ATH tokens...")
+    print("🔍 Checking for ATH tokens...")
     
     # Load previously sent tokens and clean old entries
     sent_tokens = load_sent_tokens()
     sent_tokens = clean_old_entries(sent_tokens)
+    print(f"📋 Tracking {len(sent_tokens)} previously sent tokens")
     
     # Get coin data
     coins_data = get_top_coins_data()
     
     if not coins_data:
-        print("No coin data received")
+        error_msg = "❌ No coin data received from API"
+        print(error_msg)
+        send_telegram_message(error_msg)
         return
     
-    print(f"Checking {len(coins_data)} coins for ATH...")
+    print(f"🔍 Checking {len(coins_data)} coins for ATH...")
     
     # Find tokens that hit ATH
     ath_tokens = []
-    current_time = datetime.now()
+    current_time = datetime.now(pytz.UTC)
     
     for coin in coins_data:
         try:
@@ -145,7 +165,7 @@ def check_ath_tokens():
             ath_datetime = datetime.fromisoformat(ath_date.replace('Z', '+00:00'))
             
             # Check if ATH was hit in the last 24 hours
-            time_diff = current_time.replace(tzinfo=pytz.UTC) - ath_datetime
+            time_diff = current_time - ath_datetime
             
             if time_diff <= timedelta(hours=24):
                 # Check if we haven't already sent this token
@@ -157,14 +177,16 @@ def check_ath_tokens():
                         'current_price': current_price,
                         'ath': ath,
                         'ath_date': ath_date,
-                        'market_cap_rank': coin.get('market_cap_rank', 'N/A')
+                        'market_cap_rank': coin.get('market_cap_rank', 'N/A'),
+                        'market_cap': coin.get('market_cap', 0)
                     })
                     
                     # Mark this token as sent
                     sent_tokens[coin_id] = current_time.isoformat()
+                    print(f"🆕 Found new ATH: {coin_name} ({coin.get('symbol', '').upper()})")
         
         except Exception as e:
-            print(f"Error processing coin {coin.get('name', 'Unknown')}: {e}")
+            print(f"⚠️ Error processing coin {coin.get('name', 'Unknown')}: {e}")
             continue
     
     # Save updated sent tokens
@@ -172,27 +194,94 @@ def check_ath_tokens():
     
     # Send results
     if ath_tokens:
-        message = f"🚀 <b>Tokens hitting ATH in last 24h:</b>\n\n"
+        # Sort by market cap (largest first)
+        ath_tokens.sort(key=lambda x: x.get('market_cap', 0), reverse=True)
         
-        for token in ath_tokens[:10]:  # Limit to 10 to avoid message being too long
-            message += f"📈 <b>{token['name']}</b> ({token['symbol']})\n"
+        message = f"🚀 <b>{len(ath_tokens)} Token(s) hitting ATH in last 24h:</b>\n\n"
+        
+        for i, token in enumerate(ath_tokens[:10], 1):  # Limit to 10
+            message += f"{i}. 📈 <b>{token['name']}</b> ({token['symbol']})\n"
             message += f"💰 Price: ${token['current_price']:,.6f}\n"
             message += f"🏆 ATH: ${token['ath']:,.6f}\n"
             message += f"📊 Rank: #{token['market_cap_rank']}\n"
-            message += f"⏰ ATH Time: {token['ath_date'][:19]}Z\n\n"
+            
+            # Format time nicely
+            ath_time = datetime.fromisoformat(token['ath_date'].replace('Z', '+00:00'))
+            formatted_time = ath_time.strftime("%m/%d %H:%M UTC")
+            message += f"⏰ ATH Time: {formatted_time}\n\n"
         
         if len(ath_tokens) > 10:
             message += f"... and {len(ath_tokens) - 10} more tokens hit ATH!"
         
-        print(f"Found {len(ath_tokens)} tokens that hit ATH")
+        print(f"🎉 Found {len(ath_tokens)} new ATH tokens!")
         send_telegram_message(message)
     else:
-        print("No new ATH tokens found")
-        send_telegram_message("📊 No tokens hit ATH in the last 24 hours.")
+        status_msg = "📊 No new ATH tokens found in the last 24 hours."
+        print(status_msg)
+        # Only send "no results" message every 6 hours to avoid spam
+        last_no_result = sent_tokens.get('_last_no_result', '')
+        if last_no_result:
+            last_time = datetime.fromisoformat(last_no_result)
+            if current_time - last_time < timedelta(hours=6):
+                return
+        
+        sent_tokens['_last_no_result'] = current_time.isoformat()
+        save_sent_tokens(sent_tokens)
+        send_telegram_message(status_msg)
+
+def test_credentials():
+    """Test if credentials are working"""
+    print("🧪 Testing credentials...")
+    
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN not set!")
+        return False
+    
+    if not TELEGRAM_CHAT_ID:
+        print("❌ TELEGRAM_CHAT_ID not set!")
+        return False
+        
+    # Test Telegram
+    test_msg = "🧪 ATH Monitor Bot - Credential Test (Pro API)"
+    if send_telegram_message(test_msg):
+        print("✅ Telegram credentials working!")
+    else:
+        print("❌ Telegram credentials failed!")
+        return False
+    
+    # Test CoinGecko Pro API
+    try:
+        url = "https://api.coingecko.com/api/v3/ping"
+        headers = {"x-cg-pro-api-key": COINGECKO_API_KEY}
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            print("✅ CoinGecko Pro API working!")
+            
+            # Test rate limits by checking plan info
+            plan_url = "https://api.coingecko.com/api/v3/key"
+            plan_response = requests.get(plan_url, headers=headers, timeout=10)
+            if plan_response.status_code == 200:
+                plan_data = plan_response.json()
+                print(f"✅ API Plan: {plan_data.get('plan', 'Unknown')}")
+                print(f"✅ Monthly calls: {plan_data.get('monthly_call_limit', 'Unknown')}")
+            
+            return True
+        else:
+            print(f"⚠️ CoinGecko API issue: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ CoinGecko API test failed: {e}")
+        return False
 
 def main():
     """Main function to run the bot"""
-    print("ATH Monitor Bot Starting...")
+    print("🤖 ATH Monitor Bot Starting...")
+    
+    # Test credentials first
+    if not test_credentials():
+        print("❌ Credential test failed. Please check your environment variables.")
+        return
     
     # Set timezone to GMT+8
     gmt8 = pytz.timezone('Asia/Singapore')
@@ -201,24 +290,44 @@ def main():
     startup_time = datetime.now(gmt8).strftime("%Y-%m-%d %H:%M:%S GMT+8")
     send_telegram_message(f"🤖 ATH Monitor Bot started at {startup_time}")
     
+    main_interval = 1800  # 30 minutes for more frequent checks with Pro API
+    
     while True:
         try:
             current_time = datetime.now(gmt8)
-            print(f"Running check at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
+            print(f"\n{'='*50}")
+            print(f"🕐 Running check at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
+            print(f"{'='*50}")
             
             check_ath_tokens()
             
-            # Wait for 1 hour (3600 seconds)
-            print("Waiting for next check in 1 hour...")
-            time.sleep(3600)
+            print(f"✅ Check completed. Waiting {main_interval//60} minutes for next check...")
+            time.sleep(main_interval)
             
         except KeyboardInterrupt:
-            print("Bot stopped by user")
+            print("\n👋 Bot stopped by user")
+            send_telegram_message("👋 ATH Monitor Bot stopped")
             break
         except Exception as e:
-            print(f"Error in main loop: {e}")
+            error_msg = f"❌ Error in main loop: {e}"
+            print(error_msg)
+            send_telegram_message(f"⚠️ Bot error: {str(e)[:100]}...")
+            
             # Wait 5 minutes before retrying if there's an error
+            print("⏰ Waiting 5 minutes before retry...")
             time.sleep(300)
 
 if __name__ == "__main__":
+    # Print setup instructions
+    print("📋 Setup Instructions for Pro API:")
+    print("Set these environment variables:")
+    print("export TELEGRAM_BOT_TOKEN='your_bot_token'")
+    print("export TELEGRAM_CHAT_ID='your_chat_id'") 
+    print("export COINGECKO_API_KEY='your_pro_api_key'  # Pro API Key Required")
+    print("\nPro API Benefits:")
+    print("✅ 10,000-50,000 calls/month (vs 100/month free)")
+    print("✅ 50 calls/minute (vs 10-30/minute free)")
+    print("✅ Checking up to 5,000 coins every 30 minutes")
+    print("-" * 50)
+    
     main()
