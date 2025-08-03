@@ -1,1 +1,1 @@
-worker: python telegram_ath_bot.py
+worker: python ath_monitor.py
