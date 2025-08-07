@@ -1,354 +1,300 @@
-import requests
-import time
-import json
-import os
-from datetime import datetime, timedelta
-import pytz
+// railway.json (Railway configuration)
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "npm start",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
 
-# Configuration - Set these as environment variables in Railway
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Set your bot token here
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # Set your chat ID here
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")   # Set your CoinGecko API key here
+// .env.example (copy to .env and fill in your values)
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+COINGECKO_API_KEY=your_coingecko_pro_api_key_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+PORT=3000
 
-# File to store tokens that already hit ATH in last 24h
-SENT_TOKENS_FILE = "sent_tokens.json"
+// package.json
+{
+  "name": "coingecko-ath-monitor",
+  "version": "1.0.0",
+  "description": "Telegram bot that monitors CoinGecko for all-time high tokens",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.3",
+    "moment-timezone": "^0.5.43",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}
 
-def load_sent_tokens():
-    """Load the list of tokens we've already sent notifications for"""
-    try:
-        if os.path.exists(SENT_TOKENS_FILE):
-            with open(SENT_TOKENS_FILE, 'r') as f:
-                data = json.load(f)
-                return data
-        return {}
-    except Exception as e:
-        print(f"Error loading sent tokens: {e}")
-        return {}
+// index.js
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const cron = require('node-cron');
+const moment = require('moment-timezone');
 
-def save_sent_tokens(sent_tokens):
-    """Save the list of tokens we've sent notifications for"""
-    try:
-        with open(SENT_TOKENS_FILE, 'w') as f:
-            json.dump(sent_tokens, f, indent=2)
-    except Exception as e:
-        print(f"Error saving sent tokens: {e}")
+// Environment variables
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-def clean_old_entries(sent_tokens):
-    """Remove entries older than 24 hours"""
-    current_time = datetime.now()
-    cleaned = {}
-    
-    for token_id, timestamp_str in sent_tokens.items():
-        try:
-            token_time = datetime.fromisoformat(timestamp_str)
-            if current_time - token_time < timedelta(hours=24):
-                cleaned[token_id] = timestamp_str
-        except:
-            continue
-    
-    return cleaned
+// Initialize bot
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-def send_telegram_message(message):
-    """Send a message to Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram credentials not set!")
-        return False
+// In-memory storage for last check times (use Redis in production)
+const lastCheckedTokens = new Map();
+
+class CoinGeckoATHMonitor {
+  constructor() {
+    this.apiBaseUrl = 'https://pro-api.coingecko.com/api/v3';
+    this.timezone = 'Asia/Singapore'; // GMT+8
+  }
+
+  async makeApiRequest(endpoint, params = {}) {
+    try {
+      const response = await axios.get(`${this.apiBaseUrl}${endpoint}`, {
+        headers: {
+          'X-Cg-Pro-Api-Key': COINGECKO_API_KEY
+        },
+        params
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`API request failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getTop3000Tokens() {
+    try {
+      const allTokens = [];
+      const perPage = 250; // CoinGecko max per page
+      const totalPages = Math.ceil(3000 / perPage);
+
+      for (let page = 1; page <= totalPages; page++) {
+        console.log(`Fetching page ${page}/${totalPages}...`);
         
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    
-    try:
-        response = requests.post(url, data=data, timeout=30)
-        if response.status_code == 200:
-            print("✅ Message sent successfully")
-            return True
-        else:
-            print(f"❌ Failed to send message: {response.status_code} - {response.text}")
-            return False
-    except Exception as e:
-        print(f"❌ Error sending message: {e}")
-        return False
+        const tokens = await this.makeApiRequest('/coins/markets', {
+          vs_currency: 'usd',
+          order: 'market_cap_desc',
+          per_page: perPage,
+          page: page,
+          sparkline: false,
+          price_change_percentage: '1h,24h'
+        });
 
-def get_top_coins_data(max_coins=5000):
-    """Fetch top coins from CoinGecko with Pro API optimization"""
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    
-    headers = {
-        "accept": "application/json",
-        "x-cg-pro-api-key": COINGECKO_API_KEY  # Pro API key header
+        allTokens.push(...tokens);
+        
+        // Rate limiting - wait 1 second between requests
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      return allTokens.slice(0, 3000); // Ensure we only get top 3000
+    } catch (error) {
+      console.error('Error fetching top 3000 tokens:', error.message);
+      throw error;
     }
-    
-    all_coins = []
-    per_page = 250
-    max_pages = max_coins // per_page  # Up to 20 pages (5000 coins) for pro tier
-    
-    print(f"📊 Fetching top {max_pages * per_page} coins with Pro API...")
-    
-    for page in range(1, max_pages + 1):
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": per_page,
-            "page": page,
-            "sparkline": False,
-            "price_change_percentage": "24h"
+  }
+
+  async checkTokenATH(tokenId) {
+    try {
+      const tokenData = await this.makeApiRequest(`/coins/${tokenId}`, {
+        localization: false,
+        tickers: false,
+        market_data: true,
+        community_data: false,
+        developer_data: false
+      });
+
+      const currentPrice = tokenData.market_data.current_price.usd;
+      const ath = tokenData.market_data.ath.usd;
+      const athDate = new Date(tokenData.market_data.ath_date.usd);
+      
+      // Check if current price is at or very close to ATH (within 0.1%)
+      const isAtATH = currentPrice >= (ath * 0.999);
+      
+      // Check if ATH was achieved in the last hour
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      const isRecentATH = athDate > oneHourAgo;
+
+      return {
+        id: tokenId,
+        name: tokenData.name,
+        symbol: tokenData.symbol.toUpperCase(),
+        currentPrice,
+        ath,
+        athDate,
+        isAtATH,
+        isRecentATH,
+        priceChange1h: tokenData.market_data.price_change_percentage_1h || 0,
+        priceChange24h: tokenData.market_data.price_change_percentage_24h || 0
+      };
+    } catch (error) {
+      console.error(`Error checking ATH for token ${tokenId}:`, error.message);
+      return null;
+    }
+  }
+
+  async findATHTokens(isInitialCheck = false) {
+    try {
+      console.log('Starting ATH token search...');
+      const tokens = await this.getTop3000Tokens();
+      const athTokens = [];
+      const now = Date.now();
+
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        
+        // Skip if we've checked this token in the last 24 hours
+        const lastChecked = lastCheckedTokens.get(token.id);
+        if (lastChecked && (now - lastChecked) < 24 * 60 * 60 * 1000) {
+          continue;
         }
-        
-        try:
-            print(f"📄 Fetching page {page}/{max_pages}...")
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                print(f"✅ Page {page}: Got {len(data)} coins")
-                all_coins.extend(data)
-                
-                # Minimal delay for Pro API - much higher rate limits
-                if page < max_pages:
-                    time.sleep(0.1)  # Very short delay for Pro API
-                    
-            elif response.status_code == 429:
-                print(f"⚠️ Rate limited on page {page}. Waiting 10 seconds...")
-                time.sleep(10)
-                continue
-            else:
-                print(f"❌ Error fetching page {page}: {response.status_code} - {response.text}")
-                break
-                
-        except Exception as e:
-            print(f"❌ Error fetching page {page}: {e}")
-            break
-    
-    print(f"📊 Total coins fetched: {len(all_coins)}")
-    return all_coins
 
-def check_ath_tokens():
-    """Check for tokens that hit ATH in the last 24 hours"""
-    print("🔍 Checking for ATH tokens...")
-    
-    # Load previously sent tokens and clean old entries
-    sent_tokens = load_sent_tokens()
-    sent_tokens = clean_old_entries(sent_tokens)
-    print(f"📋 Tracking {len(sent_tokens)} previously sent tokens")
-    
-    # Get coin data
-    coins_data = get_top_coins_data()
-    
-    if not coins_data:
-        error_msg = "❌ No coin data received from API"
-        print(error_msg)
-        send_telegram_message(error_msg)
-        return
-    
-    print(f"🔍 Checking {len(coins_data)} coins for ATH...")
-    
-    # Find tokens that hit ATH
-    ath_tokens = []
-    current_time = datetime.now(pytz.UTC)
-    
-    for coin in coins_data:
-        try:
-            coin_id = coin.get('id')
-            coin_name = coin.get('name')
-            current_price = coin.get('current_price')
-            ath = coin.get('ath')
-            ath_date = coin.get('ath_date')
-            
-            if not all([coin_id, coin_name, current_price, ath, ath_date]):
-                continue
-            
-            # Parse ATH date
-            ath_datetime = datetime.fromisoformat(ath_date.replace('Z', '+00:00'))
-            
-            # Check if ATH was hit in the last 24 hours
-            time_diff = current_time - ath_datetime
-            
-            if time_diff <= timedelta(hours=24):
-                # Check if we haven't already sent this token
-                if coin_id not in sent_tokens:
-                    ath_tokens.append({
-                        'id': coin_id,
-                        'name': coin_name,
-                        'symbol': coin.get('symbol', '').upper(),
-                        'current_price': current_price,
-                        'ath': ath,
-                        'ath_date': ath_date,
-                        'market_cap_rank': coin.get('market_cap_rank', 'N/A'),
-                        'market_cap': coin.get('market_cap', 0)
-                    })
-                    
-                    # Mark this token as sent
-                    sent_tokens[coin_id] = current_time.isoformat()
-                    print(f"🆕 Found new ATH: {coin_name} ({coin.get('symbol', '').upper()})")
+        console.log(`Checking ${token.name} (${i + 1}/${tokens.length})...`);
         
-        except Exception as e:
-            print(f"⚠️ Error processing coin {coin.get('name', 'Unknown')}: {e}")
-            continue
-    
-    # Save updated sent tokens
-    save_sent_tokens(sent_tokens)
-    
-    # Send results
-    if ath_tokens:
-        # Sort by market cap (largest first)
-        ath_tokens.sort(key=lambda x: x.get('market_cap', 0), reverse=True)
+        const athInfo = await this.checkTokenATH(token.id);
         
-        message = f"🚀 <b>{len(ath_tokens)} Token(s) hitting ATH in last 24h:</b>\n\n"
-        
-        for i, token in enumerate(ath_tokens[:10], 1):  # Limit to 10
-            message += f"{i}. 📈 <b>{token['name']}</b> ({token['symbol']})\n"
-            message += f"💰 Price: ${token['current_price']:,.6f}\n"
-            message += f"🏆 ATH: ${token['ath']:,.6f}\n"
-            message += f"📊 Rank: #{token['market_cap_rank']}\n"
-            
-            # Format time nicely
-            ath_time = datetime.fromisoformat(token['ath_date'].replace('Z', '+00:00'))
-            formatted_time = ath_time.strftime("%m/%d %H:%M UTC")
-            message += f"⏰ ATH Time: {formatted_time}\n\n"
-        
-        if len(ath_tokens) > 10:
-            message += f"... and {len(ath_tokens) - 10} more tokens hit ATH!"
-        
-        print(f"🎉 Found {len(ath_tokens)} new ATH tokens!")
-        send_telegram_message(message)
-    else:
-        status_msg = "📊 No new ATH tokens found in the last 24 hours."
-        print(status_msg)
-        # Only send "no results" message every 6 hours to avoid spam
-        last_no_result = sent_tokens.get('_last_no_result', '')
-        if last_no_result:
-            last_time = datetime.fromisoformat(last_no_result)
-            if current_time - last_time < timedelta(hours=6):
-                return
-        
-        sent_tokens['_last_no_result'] = current_time.isoformat()
-        save_sent_tokens(sent_tokens)
-        send_telegram_message(status_msg)
+        if (athInfo) {
+          if (isInitialCheck) {
+            // For initial check, look for tokens that hit ATH in the past hour
+            if (athInfo.isRecentATH) {
+              athTokens.push(athInfo);
+              lastCheckedTokens.set(token.id, now);
+            }
+          } else {
+            // For regular checks, look for current ATH tokens
+            if (athInfo.isAtATH) {
+              athTokens.push(athInfo);
+              lastCheckedTokens.set(token.id, now);
+            }
+          }
+        }
 
-def test_credentials():
-    """Test if credentials are working"""
-    print("🧪 Testing credentials...")
-    
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN not set!")
-        return False
-    
-    if not TELEGRAM_CHAT_ID:
-        print("❌ TELEGRAM_CHAT_ID not set!")
-        return False
-        
-    # Test Telegram
-    test_msg = "🧪 ATH Monitor Bot - Credential Test (Pro API)"
-    if send_telegram_message(test_msg):
-        print("✅ Telegram credentials working!")
-    else:
-        print("❌ Telegram credentials failed!")
-        return False
-    
-    # Test CoinGecko Pro API
-    try:
-        url = "https://api.coingecko.com/api/v3/ping"
-        headers = {"x-cg-pro-api-key": COINGECKO_API_KEY}
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            print("✅ CoinGecko Pro API working!")
-            
-            # Test rate limits by checking plan info
-            plan_url = "https://api.coingecko.com/api/v3/key"
-            plan_response = requests.get(plan_url, headers=headers, timeout=10)
-            if plan_response.status_code == 200:
-                plan_data = plan_response.json()
-                print(f"✅ API Plan: {plan_data.get('plan', 'Unknown')}")
-                print(f"✅ Monthly calls: {plan_data.get('monthly_call_limit', 'Unknown')}")
-            
-            return True
-        else:
-            print(f"⚠️ CoinGecko API issue: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"❌ CoinGecko API test failed: {e}")
-        return False
+        // Rate limiting - wait 1.2 seconds between detailed requests
+        await new Promise(resolve => setTimeout(resolve, 1200));
+      }
 
-def main():
-    """Main function to run the bot"""
-    print("🤖 ATH Monitor Bot Starting on Railway...")
-    
-    # Test credentials first
-    if not test_credentials():
-        print("❌ Credential test failed. Please check your Railway environment variables.")
-        return
-    
-    # Set timezone to GMT+8
-    gmt8 = pytz.timezone('Asia/Singapore')
-    
-    # Send startup message
-    startup_time = datetime.now(gmt8).strftime("%Y-%m-%d %H:%M:%S GMT+8")
-    send_telegram_message(f"🤖 ATH Monitor Bot started on Railway at {startup_time}")
-    
-    main_interval = 3600  # 1 hour schedule
-    
-    # FIRST RUN - Execute immediately to test
-    print(f"\n{'='*60}")
-    print(f"🚀 INITIAL TEST RUN - Running immediately to verify bot works")
-    print(f"{'='*60}")
-    
-    try:
-        current_time = datetime.now(gmt8)
-        print(f"🕐 Test run at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
-        
-        check_ath_tokens()
-        
-        print(f"✅ Initial test completed successfully!")
-        print(f"🔄 Bot will now run every {main_interval//60} minutes")
-        send_telegram_message(f"✅ Initial test completed! Bot is working on Railway and will check every {main_interval//60} minutes.")
-        
-    except Exception as e:
-        error_msg = f"❌ Initial test failed: {e}"
-        print(error_msg)
-        send_telegram_message(f"❌ Initial test failed: {str(e)[:100]}...")
-        print("🛑 Stopping bot due to initial test failure")
-        return
-    
-    # Continue with regular schedule
-    while True:
-        try:
-            print(f"\n⏰ Waiting {main_interval//60} minutes until next check...")
-            time.sleep(main_interval)
-            
-            current_time = datetime.now(gmt8)
-            print(f"\n{'='*50}")
-            print(f"🕐 Scheduled check at {current_time.strftime('%Y-%m-%d %H:%M:%S GMT+8')}")
-            print(f"{'='*50}")
-            
-            check_ath_tokens()
-            
-            print(f"✅ Scheduled check completed.")
-            
-        except KeyboardInterrupt:
-            print("\n👋 Bot stopped by user")
-            send_telegram_message("👋 ATH Monitor Bot stopped")
-            break
-        except Exception as e:
-            error_msg = f"❌ Error in main loop: {e}"
-            print(error_msg)
-            send_telegram_message(f"⚠️ Bot error: {str(e)[:100]}...")
-            
-            # Wait 5 minutes before retrying if there's an error
-            print("⏰ Waiting 5 minutes before retry...")
-            time.sleep(300)
+      return athTokens;
+    } catch (error) {
+      console.error('Error finding ATH tokens:', error.message);
+      throw error;
+    }
+  }
 
-if __name__ == "__main__":
-    # Print Railway deployment info
-    print("🚂 Railway ATH Monitor Bot")
-    print("📋 Required Railway Environment Variables:")
-    print("- TELEGRAM_BOT_TOKEN")
-    print("- TELEGRAM_CHAT_ID") 
-    print("- COINGECKO_API_KEY")
-    print("-" * 50)
+  formatATHMessage(athTokens) {
+    if (athTokens.length === 0) {
+      return '🔍 No tokens made all-time high during the monitored period.';
+    }
+
+    let message = `🚀 *ALL-TIME HIGH ALERT* 🚀\n\n`;
+    message += `Found ${athTokens.length} token(s) at all-time high:\n\n`;
+
+    athTokens.forEach((token, index) => {
+      message += `${index + 1}. *${token.name}* (${token.symbol})\n`;
+      message += `   💰 Price: $${token.currentPrice.toLocaleString()}\n`;
+      message += `   📈 ATH: $${token.ath.toLocaleString()}\n`;
+      message += `   📅 ATH Date: ${moment(token.athDate).tz(this.timezone).format('YYYY-MM-DD HH:mm:ss')} GMT+8\n`;
+      message += `   📊 1h: ${token.priceChange1h.toFixed(2)}% | 24h: ${token.priceChange24h.toFixed(2)}%\n\n`;
+    });
+
+    message += `_Last updated: ${moment().tz(this.timezone).format('YYYY-MM-DD HH:mm:ss')} GMT+8_`;
     
-    main()
+    return message;
+  }
+
+  async sendTelegramMessage(message) {
+    try {
+      await bot.sendMessage(TELEGRAM_CHAT_ID, message, {
+        parse_mode: 'Markdown'
+      });
+      console.log('Telegram message sent successfully');
+    } catch (error) {
+      console.error('Error sending Telegram message:', error.message);
+    }
+  }
+}
+
+// Initialize monitor
+const monitor = new CoinGeckoATHMonitor();
+
+// Initial check on startup
+async function initialCheck() {
+  console.log('Performing initial check for tokens with ATH in the past hour...');
+  try {
+    const athTokens = await monitor.findATHTokens(true);
+    const message = monitor.formatATHMessage(athTokens);
+    await monitor.sendTelegramMessage(message);
+  } catch (error) {
+    console.error('Initial check failed:', error.message);
+    await monitor.sendTelegramMessage('❌ Initial ATH check failed. Please check the logs.');
+  }
+}
+
+// Daily check at 00:00 GMT+8
+cron.schedule('0 0 * * *', async () => {
+  console.log('Running daily ATH check at 00:00 GMT+8...');
+  try {
+    const athTokens = await monitor.findATHTokens(false);
+    const message = monitor.formatATHMessage(athTokens);
+    await monitor.sendTelegramMessage(message);
+  } catch (error) {
+    console.error('Daily check failed:', error.message);
+    await monitor.sendTelegramMessage('❌ Daily ATH check failed. Please check the logs.');
+  }
+}, {
+  timezone: "Asia/Singapore"
+});
+
+// Health check endpoint for Railway
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'running',
+    message: 'CoinGecko ATH Monitor is active',
+    lastCheckedTokens: lastCheckedTokens.size,
+    timezone: 'GMT+8'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log('CoinGecko ATH Monitor started');
+  
+  // Run initial check after 30 seconds to allow server to fully start
+  setTimeout(() => {
+    initialCheck();
+  }, 30000);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, shutting down gracefully');
+  process.exit(0);
+});
